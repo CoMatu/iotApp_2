@@ -414,6 +414,86 @@ class HuaweiCrypto {
     return out.sublist(0, offset);
   }
 
+  /// Huawei HiChain uses AES-GCM with a non-empty AAD.
+  /// gadgetbridge uses:
+  /// - encrypt(encData): AAD="hichain_iso_exchange".bytes
+  /// - decrypt(encAuthToken): AAD=challengeBytes (random 16 bytes)
+  static Uint8List encryptAesGcmNoPadWithAad(
+    Uint8List data,
+    Uint8List key,
+    Uint8List iv,
+    Uint8List aad,
+  ) {
+    final cipher = GCMBlockCipher(AESEngine());
+    final params = AEADParameters(KeyParameter(key), 16 * 8, iv, aad);
+    cipher.init(true, params);
+
+    final out = Uint8List(cipher.getOutputSize(data.length));
+    var offset = cipher.processBytes(data, 0, data.length, out, 0);
+    offset += cipher.doFinal(out, offset);
+    return out.sublist(0, offset);
+  }
+
+  static Uint8List decryptAesGcmNoPadWithAad(
+    Uint8List data,
+    Uint8List key,
+    Uint8List iv,
+    Uint8List aad,
+  ) {
+    final cipher = GCMBlockCipher(AESEngine());
+    final params = AEADParameters(KeyParameter(key), 16 * 8, iv, aad);
+    cipher.init(false, params);
+
+    final out = Uint8List(cipher.getOutputSize(data.length));
+    var offset = cipher.processBytes(data, 0, data.length, out, 0);
+    offset += cipher.doFinal(out, offset);
+    return out.sublist(0, offset);
+  }
+
+  static Uint8List hmacSha256(Uint8List key, Uint8List message) {
+    final h = Hmac(sha256, key);
+    return Uint8List.fromList(h.convert(message).bytes);
+  }
+
+  static Uint8List sha256Bytes(Uint8List bytes) {
+    return Uint8List.fromList(sha256.convert(bytes).bytes);
+  }
+
+  /// Ported from gadgetbridge CryptoUtils.hkdfSha256.
+  static Uint8List hkdfSha256({
+    required Uint8List secretKey,
+    required Uint8List salt,
+    required Uint8List info,
+    required int outputLength,
+  }) {
+    const hashLen = 32;
+
+    // pseudoRandomKey = calcHmacSha256(salt, secretKey)  (key=salt, data=secretKey)
+    final pseudoRandomKey = hmacSha256(salt, secretKey);
+
+    final n = (outputLength % hashLen == 0)
+        ? outputLength ~/ hashLen
+        : (outputLength ~/ hashLen) + 1;
+
+    var hashRound = Uint8List(0);
+    final generated = Uint8List(n * hashLen);
+    var offset = 0;
+
+    // mac init: key = pseudoRandomKey
+    for (var roundNum = 1; roundNum <= n; roundNum++) {
+      final t = Uint8List(hashRound.length + info.length + 1)
+        ..setAll(0, hashRound)
+        ..setAll(hashRound.length, info);
+      t[t.length - 1] = roundNum & 0xFF;
+
+      hashRound = hmacSha256(pseudoRandomKey, t);
+      generated.setRange(offset, offset + hashRound.length, hashRound);
+      offset += hashRound.length;
+    }
+
+    return generated.sublist(0, outputLength);
+  }
+
   Uint8List _encryptAesCbcPkcs7(Uint8List data, Uint8List key, Uint8List iv) {
     final paddingCipher = PaddedBlockCipherImpl(PKCS7Padding(), CBCBlockCipher(AESEngine()));
     paddingCipher.init(

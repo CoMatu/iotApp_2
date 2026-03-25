@@ -134,7 +134,9 @@ class HuaweiPacketCodec {
 
     final int serviceId = payloadForParse[0];
     final int commandId = payloadForParse[1];
-    final tlvBytes = payloadForParse.length > 2 ? payloadForParse.sublist(2) : Uint8List(0);
+    final tlvBytes = payloadForParse.length > 2
+        ? payloadForParse.sublist(2)
+        : Uint8List(0);
 
     final tlv = HuaweiTLV().parse(tlvBytes, 0, tlvBytes.length);
     return HuaweiPacket(serviceId: serviceId, commandId: commandId, tlv: tlv);
@@ -179,18 +181,33 @@ class HuaweiPacketCodec {
     required Uint8List serializedTlv,
     required int sliceSize,
   }) {
-    final int headerLength = 5; // Magic + (short)(bodyLength + 1) + 0x00 + extra slice info
+    final int headerLength =
+        5; // Magic + (short)(bodyLength + 1) + 0x00 + extra slice info
     final int bodyHeaderLength = 2; // sID + cID
     final int footerLength = 2; // CRC16
     final int maxBodySize = sliceSize - headerLength - footerLength;
     if (maxBodySize <= 0) {
       // Fallback to unsliced if slice size is too small for any slicing.
-      return [serializeUnsliced(serviceId: serviceId, commandId: commandId, serializedTlv: serializedTlv)];
+      return [
+        serializeUnsliced(
+          serviceId: serviceId,
+          commandId: commandId,
+          serializedTlv: serializedTlv,
+        ),
+      ];
     }
 
-    final packetCount = ((serializedTlv.length + bodyHeaderLength) + maxBodySize - 1) ~/ maxBodySize;
+    final packetCount =
+        ((serializedTlv.length + bodyHeaderLength) + maxBodySize - 1) ~/
+        maxBodySize;
     if (packetCount <= 1) {
-      return [serializeUnsliced(serviceId: serviceId, commandId: commandId, serializedTlv: serializedTlv)];
+      return [
+        serializeUnsliced(
+          serviceId: serviceId,
+          commandId: commandId,
+          serializedTlv: serializedTlv,
+        ),
+      ];
     }
 
     final tlvBuffer = Uint8List.fromList(serializedTlv);
@@ -203,7 +220,9 @@ class HuaweiPacketCodec {
     for (var i = 0; i < packetCount; i++) {
       final int remainingTlv = tlvBuffer.length - tlvIdx;
       final int computedPacketSize = remainingTlv + headerLength + footerLength;
-      final int actualPacketSize = computedPacketSize < sliceSize ? computedPacketSize : sliceSize;
+      final int actualPacketSize = computedPacketSize < sliceSize
+          ? computedPacketSize
+          : sliceSize;
 
       final packet = Uint8List(actualPacketSize);
       var p = 0;
@@ -236,7 +255,8 @@ class HuaweiPacketCodec {
       p += take;
 
       // Build CRC prefix.
-      final int crcPrefixLen = actualPacketSize - footerLength; // exact prefix without CRC.
+      final int crcPrefixLen =
+          actualPacketSize - footerLength; // exact prefix without CRC.
       final crc = crc16(packet.sublist(0, crcPrefixLen), 0x0000) & 0xFFFF;
       // Put CRC.
       _writeUint16BE(packet, actualPacketSize - footerLength, crc);
@@ -269,4 +289,3 @@ class HuaweiPacketCodec {
     out[offset + 1] = v & 0xFF;
   }
 }
-

@@ -38,6 +38,7 @@ dependencies:
   go_router: ^17.1.0
   crypto: ^3.0.7
   pointycastle: ^4.0.0
+  device_info_plus: ^12.3.0
 
 dev_dependencies:
   flutter_test:

@@ -39,7 +39,9 @@ class _DevicePageState extends State<DevicePage> {
       final result = await manager.pairAndInitialize(deviceId: widget.deviceId);
       if (!mounted) return;
       setState(() {
-        _isPaired = true;
+        // pairing считаем успешным только при наличии критичных данных.
+        // Для UI считаем "готово", если удалось прочитать батарею.
+        _isPaired = (result.batteryLevel != null);
         _productModel = result.productModel;
         _batteryLevel = result.batteryLevel;
       });
