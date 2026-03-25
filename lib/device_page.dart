@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:universal_ble/universal_ble.dart';
 
+import 'package:iot_monitor_2/huawei/huawei_pairing_manager.dart';
+
 class DevicePage extends StatefulWidget {
   const DevicePage({super.key, required this.deviceId});
 
@@ -14,23 +16,12 @@ class _DevicePageState extends State<DevicePage> {
   bool _isPairing = false;
   bool _isUnpairing = false;
   bool? _isPaired;
+  String? _productModel;
+  int? _batteryLevel;
 
   @override
   void initState() {
     super.initState();
-    _loadPairedState();
-  }
-
-  Future<void> _loadPairedState() async {
-    try {
-      final paired = await UniversalBle.isPaired(widget.deviceId);
-      if (!mounted) return;
-      setState(() {
-        _isPaired = paired;
-      });
-    } catch (_) {
-      // If the platform requires pairingCommand for status, ignore silently.
-    }
   }
 
   Future<void> _pair() async {
@@ -43,19 +34,23 @@ class _DevicePageState extends State<DevicePage> {
       } catch (_) {
         // Ignore stop scan errors (e.g. scan already stopped).
       }
-      await UniversalBle.pair(widget.deviceId);
+
+      final manager = HuaweiBand10PairingManager();
+      final result = await manager.pairAndInitialize(deviceId: widget.deviceId);
       if (!mounted) return;
       setState(() {
         _isPaired = true;
+        _productModel = result.productModel;
+        _batteryLevel = result.batteryLevel;
       });
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Pairing successful')),
+        const SnackBar(content: Text('Device is ready for daily use')),
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Pairing failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Pairing failed: $e')));
     } finally {
       if (!mounted) return;
       setState(() => _isPairing = false);
@@ -71,14 +66,14 @@ class _DevicePageState extends State<DevicePage> {
       setState(() {
         _isPaired = false;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Unpair successful')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Unpair successful')));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Unpair failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Unpair failed: $e')));
     } finally {
       if (!mounted) return;
       setState(() => _isUnpairing = false);
@@ -116,8 +111,29 @@ class _DevicePageState extends State<DevicePage> {
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16.0),
               child: Text(
-                _isPaired == true ? 'Paired' : 'Not paired',
+                _isPaired == true
+                    ? 'Готово для повседневного использования'
+                    : 'Не готово',
                 style: Theme.of(context).textTheme.bodyMedium,
+              ),
+            ),
+          if (_isPaired == true &&
+              (_productModel != null || _batteryLevel != null))
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16.0),
+              child: Column(
+                children: [
+                  if (_productModel != null)
+                    Text(
+                      'Модель: $_productModel',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                  if (_batteryLevel != null)
+                    Text(
+                      'Батарея: $_batteryLevel%',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                ],
               ),
             ),
           const Spacer(),
@@ -132,7 +148,7 @@ class _DevicePageState extends State<DevicePage> {
                 label: Text(
                   _isPairing
                       ? 'Pairing...'
-                      : (_isPaired == true ? 'Paired' : 'Pair'),
+                      : (_isPaired == true ? 'Готово' : 'Pair'),
                 ),
                 onPressed: (_isPairing || _isUnpairing || _isPaired == true)
                     ? null
