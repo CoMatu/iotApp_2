@@ -971,7 +971,9 @@ class HuaweiBand10PairingManager {
           );
         }
 
-        // Step 4 (bind) - step3 is implicit in gadgetbridge implementation.
+        // Step 3 (bind) and Step 4 (bind response).
+        // Проблема вашего лога как раз в пропуске сообщения с message=0x13.
+        // Делаем явный Step3, после чего ждём ответ Step4.
         final Uint8List saltBind = concatBytes([randSelfBind, randPeerBind]);
         final Uint8List sessionKeyBind = HuaweiCrypto.hkdfSha256(
           secretKey: pskBind,
@@ -980,44 +982,64 @@ class HuaweiBand10PairingManager {
           outputLength: 32,
         );
 
-        final Uint8List nonceStep4Bind = randomBytes(12);
+        final Uint8List nonceStep3Bind = randomBytes(12);
         final Uint8List encResultBind = HuaweiCrypto.encryptAesGcmNoPadWithAad(
           Uint8List(4),
           sessionKeyBind,
-          nonceStep4Bind,
+          nonceStep3Bind,
           aadIsoResult,
         );
 
-        final step4BindTlv = buildHiChainRequestTlv(
+        final step3BindTlv = buildHiChainRequestTlv(
           operationCode: 0x02,
           requestId: requestIdBind,
-          // In gadgetbridge, bind branch does:
-          // - step==0x03: if operationCode!=0x01 -> step += 0x01
-          // - then step==0x04 -> StepFour
-          // createJson() ORs messageId|=0x10 for operationCode==0x02,
-          // so message becomes 0x14.
-          messageId: 0x04,
+          messageId: 0x03, // effective message becomes 0x13 for bind.
           payloadExtra: {
-            'nonce': hex(nonceStep4Bind),
+            // Step3 повторяет peerAuthId/token из Step2 и добавляет nonce/encResult.
+            'peerAuthId': hex(selfAuthId),
+            'token': hex(selfTokenBind),
             'encResult': hex(encResultBind),
+            'nonce': hex(nonceStep3Bind),
             'operationCode': 0x02,
           },
-          outerExtra: const {},
+          outerExtra: const {'isDeviceLevel': false},
         );
 
-        // Some firmwares don't answer on HiChain3 bind step4, but pairing can still succeed.
+        // Некоторые прошивки могут не прислать ответ на Step4, но мы ждём его
+        // в тех же рамках, что и раньше (и для Band10 это критично).
         await sendPacket(
           serviceId: _serviceId,
           commandId: _cmdHiChain,
-          tlv: step4BindTlv,
+          tlv: step3BindTlv,
           encryptedTlV: false,
           isSliced: true,
         );
         try {
-          await waitPacket(_serviceId, _cmdHiChain);
+          final step4RespPkt = await waitPacket(_serviceId, _cmdHiChain);
+          try {
+            final payload4 = parseHiChainPayload(step4RespPkt.tlv);
+            debugPrint(
+              '🧾 [PAIR] HiChain3 bind Step4 payload keys=${payload4.keys} errorCode=${payload4['errorCode']} returnCodeMac=${payload4['returnCodeMac']}',
+            );
+          } catch (e) {
+            debugPrint(
+              '⚠️ [PAIR] HiChain3 bind Step4 payload parse failed: $e',
+            );
+          }
+        } on TimeoutException catch (_) {
+          if (deviceSupportType == 0x04) {
+            // For Band 10 (HiChain3), skipping init after this timeout reduces
+            // the chance of device-side disconnect on SupportedServices.
+            throw StateError(
+              'HiChain3 bind Step4 response timeout (Band10) after Step3',
+            );
+          }
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 bind Step4 response timeout after Step3, continuing...',
+          );
         } catch (_) {
           debugPrint(
-            '⚠️ [PAIR] HiChain3 bind Step4 response timeout, continuing...',
+            '⚠️ [PAIR] HiChain3 bind Step4 response timeout after Step3, continuing...',
           );
         }
 
