@@ -1,3 +1,5 @@
+// ignore_for_file: unused_element, unused_field
+
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
@@ -98,6 +100,65 @@ class HuaweiStoredSession {
   }
 }
 
+class HuaweiLiveMetrics {
+  final String? deviceId;
+  final bool isConnected;
+  final int? heartRate;
+  final int? steps;
+  final DateTime updatedAt;
+
+  const HuaweiLiveMetrics({
+    required this.deviceId,
+    required this.isConnected,
+    required this.heartRate,
+    required this.steps,
+    required this.updatedAt,
+  });
+
+  factory HuaweiLiveMetrics.disconnected() {
+    return HuaweiLiveMetrics(
+      deviceId: null,
+      isConnected: false,
+      heartRate: null,
+      steps: null,
+      updatedAt: DateTime.now(),
+    );
+  }
+
+  HuaweiLiveMetrics copyWith({
+    String? deviceId,
+    bool? isConnected,
+    int? heartRate,
+    bool clearHeartRate = false,
+    int? steps,
+    bool clearSteps = false,
+  }) {
+    return HuaweiLiveMetrics(
+      deviceId: deviceId ?? this.deviceId,
+      isConnected: isConnected ?? this.isConnected,
+      heartRate: clearHeartRate ? null : (heartRate ?? this.heartRate),
+      steps: clearSteps ? null : (steps ?? this.steps),
+      updatedAt: DateTime.now(),
+    );
+  }
+}
+
+class _HuaweiRuntimeCrypto {
+  final Uint8List secretKey;
+  final int encryptMethod;
+  final int deviceSupportType;
+  int encryptionCounter;
+  final int sliceSize;
+
+  _HuaweiRuntimeCrypto({
+    required this.secretKey,
+    required this.encryptMethod,
+    required this.deviceSupportType,
+    required this.encryptionCounter,
+    required this.sliceSize,
+  });
+}
+
 class HuaweiBand10PairingManager {
   // Band 10 proprietary transport.
   static const String _serviceUuid = 'FE86';
@@ -129,6 +190,20 @@ class HuaweiBand10PairingManager {
   static const int _cmdBatteryLevel = 0x08; // 0x01/0x08
   static const int _cmdBatteryLevelChange = 0x27; // 0x01/0x27 (async battery update)
   static const int _cmdSupportedServices = 0x02; // 0x01/0x02
+  static const int _serviceFitnessData = 0x07; // FitnessData.id
+  static const int _serviceWorkout = 0x17; // Workout.id
+  static const int _cmdFitnessTotals = 0x03; // FitnessData.FitnessTotals.id
+  static const int _cmdEnableRealtimeHeartRate = 0x1C; // FitnessData.EnableRealtimeHeartRate.id
+  static const int _cmdNotifyRestHeartRate = 0x23; // FitnessData.NotifyRestHeartRate.id
+  static const int _cmdWorkoutNotifyHeartRate = 0x17; // Workout.NotifyHeartRate.id
+  static const int _cmdStepDataCount = 0x0A; // FitnessData.MessageCount.stepId
+  static const int _cmdStepData = 0x0B; // FitnessData.MessageData.stepId
+  static const int _serviceDataSync = 0x37; // DataSync.id
+  static const int _cmdDataSyncConfig = 0x01; // DataSync.ConfigCommand.id
+  static const int _cmdDataSyncEvent = 0x02; // DataSync.EventCommand.id
+  static const int _cmdDataSyncData = 0x03; // DataSync.DataCommand.id
+  static const int _cmdDataSyncDictData = 0x04; // DataSync.DictDataCommand.id
+  static const int _dataSyncStepsGoalConfigId = 900200006;
 
   // ProductInfo tags for non-AW devices.
   static const List<int> _productInfoTagsNormal = [
@@ -196,6 +271,743 @@ class HuaweiBand10PairingManager {
     0x34,
     0x35,
   ];
+
+  final StreamController<HuaweiLiveMetrics> _liveMetricsController =
+      StreamController<HuaweiLiveMetrics>.broadcast();
+  StreamSubscription<Uint8List>? _liveMetricsSubscription;
+  Timer? _liveMetricsPollTimer;
+  final Map<String, Queue<Completer<HuaweiPacket>>> _liveWaiters = {};
+  HuaweiLiveMetrics _latestLiveMetrics = HuaweiLiveMetrics.disconnected();
+  String? _liveMetricsDeviceId;
+  _HuaweiRuntimeCrypto? _runtimeCrypto;
+  int _liveRequestMode = 0;
+  static const int _statusOk = 0x000186A0;
+  static const int _statusUnsupported = 0x000186A4;
+  bool _dataSyncBootstrapDone = false;
+  bool _directLiveFallbackUsed = false;
+  bool _dataSyncBootstrapAttempted = false;
+
+  Stream<HuaweiLiveMetrics> get liveMetricsStream => _liveMetricsController.stream;
+  HuaweiLiveMetrics get latestLiveMetrics => _latestLiveMetrics;
+
+  Future<void> startLiveMetrics(String deviceId) async {
+    await stopLiveMetrics(
+      disconnectDevice: false,
+      clearRuntimeCrypto: false,
+    );
+    _liveMetricsDeviceId = deviceId;
+    _latestLiveMetrics = HuaweiLiveMetrics(
+      deviceId: deviceId,
+      isConnected: true,
+      heartRate: null,
+      steps: null,
+      updatedAt: DateTime.now(),
+    );
+    _liveRequestMode = 0;
+    _dataSyncBootstrapDone = false;
+    _directLiveFallbackUsed = false;
+    _dataSyncBootstrapAttempted = false;
+    _liveMetricsController.add(_latestLiveMetrics);
+  }
+
+  Future<void> stopLiveMetrics({
+    bool disconnectDevice = false,
+    bool clearRuntimeCrypto = true,
+  }) async {
+    final liveDeviceId = _liveMetricsDeviceId;
+    await _liveMetricsSubscription?.cancel();
+    _liveMetricsSubscription = null;
+    _liveMetricsPollTimer?.cancel();
+    _liveMetricsPollTimer = null;
+    _liveWaiters.clear();
+    _liveMetricsDeviceId = null;
+    if (clearRuntimeCrypto) {
+      _runtimeCrypto = null;
+    }
+    _dataSyncBootstrapDone = false;
+    _directLiveFallbackUsed = false;
+    _dataSyncBootstrapAttempted = false;
+    _emitDisconnected();
+    if (liveDeviceId != null) {
+      try {
+        await UniversalBle.unsubscribe(liveDeviceId, _serviceUuid, _rxUuid);
+      } catch (_) {}
+      if (disconnectDevice) {
+        try {
+          await UniversalBle.disconnect(liveDeviceId);
+        } catch (_) {}
+      }
+    }
+  }
+
+  Future<void> dispose() async {
+    await stopLiveMetrics();
+    await _liveMetricsController.close();
+  }
+
+  void _consumeLivePacket(HuaweiPacket packet) {
+    // Stub mode: metric parsing is intentionally disabled.
+    return;
+  }
+
+  Uint8List? _safeGetBytes(HuaweiTLV tlv, int tag) {
+    try {
+      final bytes = tlv.getBytes(tag);
+      if (bytes.isEmpty) return null;
+      return bytes;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  int? _safeGetUnsignedInt(HuaweiTLV tlv, int tag, {int maxBytes = 4}) {
+    final bytes = _safeGetBytes(tlv, tag);
+    if (bytes == null || bytes.isEmpty || bytes.length > maxBytes) return null;
+    var value = 0;
+    for (final b in bytes) {
+      value = (value << 8) | (b & 0xFF);
+    }
+    return value;
+  }
+
+  int? _normalizeHeartRate(int? rawHeart) {
+    if (rawHeart == null || rawHeart <= 0) return null;
+    if (rawHeart > 230 && rawHeart <= 2500) {
+      // Some firmwares may report heart rate in tenths (e.g. 600 -> 60 bpm).
+      return rawHeart ~/ 10;
+    }
+    if (rawHeart < 35 || rawHeart > 230) return null;
+    return rawHeart;
+  }
+
+  int? _parseFitnessTotalsSteps(HuaweiTLV tlv) {
+    final containerBytes = _safeGetBytes(tlv, 0x81);
+    if (containerBytes == null || containerBytes.isEmpty) return null;
+    final container = HuaweiTLV().parse(containerBytes, 0, containerBytes.length);
+    var totalSteps = 0;
+    for (final entry in container.entries) {
+      if (entry.tag != 0x83 || entry.value.isEmpty) continue;
+      final item = HuaweiTLV().parse(entry.value, 0, entry.value.length);
+      final steps = _safeGetUnsignedInt(item, 0x05, maxBytes: 4);
+      if (steps != null) totalSteps += steps;
+    }
+    return totalSteps > 0 ? totalSteps : null;
+  }
+
+  void _adjustLiveRequestMode(HuaweiTLV tlv) {
+    final status = _safeGetUnsignedInt(tlv, 0x7F, maxBytes: 4);
+    if (status == _statusUnsupported && _liveRequestMode < 2) {
+      _liveRequestMode += 1;
+      if (_liveRequestMode >= 2) {
+        _directLiveFallbackUsed = true;
+      }
+    } else if (status == _statusOk) {
+      // Keep current successful mode.
+    }
+  }
+
+  void _completeLiveWaiter(HuaweiPacket packet) {
+    final key = '${packet.serviceId}:${packet.commandId}';
+    final q = _liveWaiters[key];
+    if (q == null || q.isEmpty) return;
+    q.removeFirst().complete(packet);
+    if (q.isEmpty) _liveWaiters.remove(key);
+  }
+
+  Future<HuaweiPacket> _waitLivePacket(
+    int serviceId,
+    int commandId, {
+    Duration timeout = const Duration(seconds: 4),
+  }) {
+    final key = '$serviceId:$commandId';
+    final c = Completer<HuaweiPacket>();
+    final q = _liveWaiters.putIfAbsent(
+      key,
+      () => Queue<Completer<HuaweiPacket>>(),
+    );
+    q.add(c);
+    return c.future.timeout(timeout).catchError((_) {
+      q.remove(c);
+      if (q.isEmpty) _liveWaiters.remove(key);
+      throw TimeoutException('Timeout waiting live packet $key');
+    });
+  }
+
+  void _emitDisconnected() {
+    _latestLiveMetrics = HuaweiLiveMetrics.disconnected();
+    _liveMetricsController.add(_latestLiveMetrics);
+  }
+
+  HuaweiTLV _decryptLiveTlvIfNeeded(HuaweiTLV tlv) {
+    final crypto = _runtimeCrypto;
+    if (crypto == null) return tlv;
+    if (!tlv.containsTag(0x7C) || !tlv.getBoolean(0x7C)) return tlv;
+    if (!tlv.containsTag(0x7D) || !tlv.containsTag(0x7E)) return tlv;
+    try {
+      final iv = tlv.getBytes(0x7D);
+      final cipherText = tlv.getBytes(0x7E);
+      final useGcm =
+          crypto.encryptMethod == 0x01 || crypto.deviceSupportType == 0x04;
+      final plain = HuaweiCrypto.decrypt(
+        useGcm,
+        cipherText,
+        crypto.secretKey,
+        iv,
+      );
+      return HuaweiTLV().parse(plain, 0, plain.length);
+    } catch (_) {
+      return tlv;
+    }
+  }
+
+  Future<void> _requestLiveMetricsBootstrap(String deviceId) async {
+    // Based on Gadgetbridge flow for Huawei Fitness/Workout packets.
+    final requests = <(int serviceId, int commandId, HuaweiTLV tlv)>[
+      (
+        _serviceWorkout,
+        _cmdWorkoutNotifyHeartRate,
+        HuaweiTLV()..putByte(0x01, _liveRequestMode == 2 ? 0x01 : 0x03),
+      ),
+      (
+        _serviceFitnessData,
+        _cmdEnableRealtimeHeartRate,
+        _liveRequestMode == 2
+            ? (HuaweiTLV()..putTag(0x01))
+            : (HuaweiTLV()..putByte(0x01, 0x01)),
+      ),
+      (
+        _serviceFitnessData,
+        _cmdNotifyRestHeartRate,
+        _liveRequestMode == 2
+            ? (HuaweiTLV()..putTag(0x01))
+            : (HuaweiTLV()..putByte(0x01, 0x01)),
+      ),
+      (
+        _serviceFitnessData,
+        _cmdFitnessTotals,
+        _liveRequestMode == 2
+            ? (HuaweiTLV()..putByte(0x01, 0x01))
+            : (HuaweiTLV()..putTag(0x01)),
+      ),
+    ];
+    for (final req in requests) {
+      try {
+        final useEncryption = _liveRequestMode != 1;
+        final serializedTlv = (useEncryption
+                ? _encryptLiveRequestTlv(req.$3)
+                : req.$3)
+            .serialize();
+        final payload = HuaweiPacketCodec.serializeUnsliced(
+          serviceId: req.$1,
+          commandId: req.$2,
+          serializedTlv: serializedTlv,
+        );
+        await UniversalBle.write(
+          deviceId,
+          _serviceUuid,
+          _txUuid,
+          payload,
+          withoutResponse: true,
+        );
+      } catch (e) {
+        debugPrint('⚠️ [LIVE] Direct live request failed: $e');
+      }
+    }
+    if (_liveRequestMode >= 2) {
+      await _requestStepDataFallback(deviceId);
+    }
+  }
+
+  Future<void> _requestStepDataFallback(String deviceId) async {
+    try {
+      final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      final startSec = nowSec - (3 * 60 * 60);
+      final countReq = HuaweiTLV()
+        ..putTag(0x81)
+        ..putInt(0x03, startSec)
+        ..putInt(0x04, nowSec);
+      await _writeLiveRequest(
+        deviceId: deviceId,
+        serviceId: _serviceFitnessData,
+        commandId: _cmdStepDataCount,
+        tlv: countReq,
+        forceEncrypted: true,
+      );
+      final countResp = await _waitLivePacket(_serviceFitnessData, _cmdStepDataCount);
+      int? count = _parseStepDataCount(countResp.tlv);
+      if (count == null && _isUnsupportedStatus(countResp.tlv)) {
+        // Some firmwares may still expect plain TLV for this command.
+        await _writeLiveRequest(
+          deviceId: deviceId,
+          serviceId: _serviceFitnessData,
+          commandId: _cmdStepDataCount,
+          tlv: countReq,
+          forceEncrypted: false,
+        );
+        final countResp2 = await _waitLivePacket(
+          _serviceFitnessData,
+          _cmdStepDataCount,
+        );
+        count = _parseStepDataCount(countResp2.tlv);
+      }
+      if (count == null || count <= 0) return;
+
+      final dataReq = HuaweiTLV()
+        ..putBytes(
+          0x81,
+          (HuaweiTLV()..putShort(0x02, 0)).serialize(),
+        );
+      await _writeLiveRequest(
+        deviceId: deviceId,
+        serviceId: _serviceFitnessData,
+        commandId: _cmdStepData,
+        tlv: dataReq,
+        forceEncrypted: true,
+      );
+      final dataResp = await _waitLivePacket(_serviceFitnessData, _cmdStepData);
+      (int, int?)? parsed = _parseStepDataSample(dataResp.tlv);
+      if (parsed == null && _isUnsupportedStatus(dataResp.tlv)) {
+        await _writeLiveRequest(
+          deviceId: deviceId,
+          serviceId: _serviceFitnessData,
+          commandId: _cmdStepData,
+          tlv: dataReq,
+          forceEncrypted: false,
+        );
+        final dataResp2 = await _waitLivePacket(_serviceFitnessData, _cmdStepData);
+        parsed = _parseStepDataSample(dataResp2.tlv);
+      }
+      if (parsed == null) return;
+      _latestLiveMetrics = _latestLiveMetrics.copyWith(
+        deviceId: _liveMetricsDeviceId,
+        isConnected: true,
+        steps: parsed.$1,
+        heartRate: _normalizeHeartRate(parsed.$2),
+      );
+      _liveMetricsController.add(_latestLiveMetrics);
+    } catch (e) {
+      debugPrint('⚠️ [LIVE] Fallback failed: $e');
+    }
+  }
+
+  Future<void> _writeLiveRequest({
+    required String deviceId,
+    required int serviceId,
+    required int commandId,
+    required HuaweiTLV tlv,
+    bool? forceEncrypted,
+  }) async {
+    final useEncryption = forceEncrypted ?? (_liveRequestMode == 0);
+    final serializedTlv = (useEncryption ? _encryptLiveRequestTlv(tlv) : tlv)
+        .serialize();
+    final frames = _runtimeCrypto == null
+        ? <Uint8List>[
+            HuaweiPacketCodec.serializeUnsliced(
+              serviceId: serviceId,
+              commandId: commandId,
+              serializedTlv: serializedTlv,
+            )
+          ]
+        : HuaweiPacketCodec.serializeSliced(
+            serviceId: serviceId,
+            commandId: commandId,
+            serializedTlv: serializedTlv,
+            sliceSize: _runtimeCrypto!.sliceSize,
+          );
+    debugPrint(
+      '🫀 [LIVE] TX sid=$serviceId cmd=$commandId enc=${useEncryption ? 1 : 0} frames=${frames.length}',
+    );
+    var idx = 0;
+    for (final frame in frames) {
+      debugPrint('🫀 [LIVE] TX frame ${idx++}/${frames.length}');
+      await UniversalBle.write(
+        deviceId,
+        _serviceUuid,
+        _txUuid,
+        frame,
+        withoutResponse: true,
+      );
+    }
+  }
+
+  bool _isUnsupportedStatus(HuaweiTLV tlv) {
+    return _safeGetUnsignedInt(tlv, 0x7F, maxBytes: 4) == _statusUnsupported;
+  }
+
+  int? _parseStepDataCount(HuaweiTLV tlv) {
+    final outer = _safeGetBytes(tlv, 0x81);
+    if (outer == null || outer.isEmpty) return null;
+    final c = HuaweiTLV().parse(outer, 0, outer.length);
+    return _safeGetUnsignedInt(c, 0x02, maxBytes: 2);
+  }
+
+  (int, int?)? _parseStepDataSample(HuaweiTLV tlv) {
+    final outer = _safeGetBytes(tlv, 0x81);
+    if (outer == null || outer.isEmpty) return null;
+    final c = HuaweiTLV().parse(outer, 0, outer.length);
+    int? steps;
+    int? heart;
+    for (final entry in c.entries) {
+      if (entry.tag != 0x84 || entry.value.isEmpty) continue;
+      final item = HuaweiTLV().parse(entry.value, 0, entry.value.length);
+      final data = _safeGetBytes(item, 0x06);
+      if (data == null || data.isEmpty) continue;
+      final tuple = _parseStepDataPayload(data);
+      if (tuple == null) continue;
+      steps = tuple.$1;
+      if (tuple.$2 != null && tuple.$2! > 0) heart = tuple.$2;
+    }
+    if (steps == null) return null;
+    return (steps, heart);
+  }
+
+  (int, int?)? _parseStepDataPayload(Uint8List data) {
+    var i = 0;
+    if (data.isEmpty) return null;
+    final bitmap1 = data[i++];
+    var bitmap2 = 0;
+    if ((bitmap1 & 0x80) != 0) {
+      if (i >= data.length) return null;
+      bitmap2 = data[i++];
+    }
+
+    var steps = 0;
+    int? heartRate;
+    for (var bit = 1; bit > 0; bit <<= 1) {
+      if ((bitmap1 & bit) == 0) continue;
+      final singleByte = bit == 0x20 || bit == 0x40;
+      if (singleByte) {
+        if (i >= data.length) return null;
+        final value = data[i++] & 0xFF;
+        if (bit == 0x40) heartRate = value;
+      } else {
+        if (i + 1 >= data.length) return null;
+        final value = ((data[i] & 0xFF) << 8) | (data[i + 1] & 0xFF);
+        i += 2;
+        if (bit == 0x02) steps = value;
+      }
+    }
+    if (bitmap2 != 0) {
+      for (var bit = 1; bit < 0x0100; bit <<= 1) {
+        if ((bitmap2 & bit) == 0) continue;
+        if (i >= data.length) return null;
+        final value = data[i++] & 0xFF;
+        if (bit == 0x02 && (heartRate == null || heartRate <= 0)) {
+          heartRate = value;
+        }
+      }
+    }
+    return (steps, heartRate);
+  }
+
+  Future<void> _requestDataSyncBootstrap(String deviceId) async {
+    if (_dataSyncBootstrapDone) return;
+    if (_dataSyncBootstrapAttempted) return;
+    _dataSyncBootstrapAttempted = true;
+
+    final packagePairs = <(String src, String dst)>[
+      ('hw.sport.config', 'in.huawei.motion'),
+      ('in.huawei.motion', 'hw.sport.config'),
+      ('hw.unitedevice.configManager', 'featureManager'),
+      ('featureManager', 'hw.unitedevice.configManager'),
+      ('hw.health.emotion', 'hw.watch.health.emotion'),
+      ('hw.health.ppgjsmodule', 'hw.watch.health.arrhythmia'),
+      ('hw.health.apneajsmodule', 'hw.watch.health.osa'),
+      ('hw.health.ecganalysis', 'hw.watch.health.ecganalysis'),
+      ('hw.health.pwv', 'com.huawei.health.pwv'),
+      ('hw.unitedevice.finddevice', 'findDevice'),
+    ];
+    debugPrint('🫀 [LIVE] DataSync bootstrap...');
+    for (final pair in packagePairs) {
+      for (final enc in const [true, false]) {
+        try {
+          final configCandidates = <HuaweiTLV>[
+            _buildDataSyncConfigTlv(srcPackage: pair.$1, dstPackage: pair.$2),
+            _buildDataSyncConfigTlvMinimal(srcPackage: pair.$1, dstPackage: pair.$2),
+          ];
+          bool ok = false;
+          for (final cfg in configCandidates) {
+            await _writeLiveRequest(
+              deviceId: deviceId,
+              serviceId: _serviceDataSync,
+              commandId: _cmdDataSyncConfig,
+              tlv: cfg,
+              forceEncrypted: enc,
+            );
+            final resp = await _waitLivePacket(_serviceDataSync, _cmdDataSyncConfig);
+            final status = _safeGetUnsignedInt(resp.tlv, 0x7F, maxBytes: 4);
+            if (status == _statusOk) {
+              ok = true;
+              break;
+            }
+          }
+          if (!ok) {
+            continue;
+          }
+          _dataSyncBootstrapDone = true;
+          debugPrint(
+            '🫀 [LIVE] DataSync ready src=${pair.$1} dst=${pair.$2} enc=${enc ? 1 : 0}',
+          );
+          final requests = <(int commandId, HuaweiTLV tlv)>[
+            (
+              _cmdDataSyncEvent,
+              HuaweiTLV()
+                ..putString(0x01, pair.$1)
+                ..putString(0x02, pair.$2)
+                ..putInt(0x03, 0)
+                ..putInt(0x04, 0)
+                ..putBytes(0x05, Uint8List(0)),
+            ),
+            (
+              _cmdDataSyncData,
+              HuaweiTLV()
+                ..putString(0x01, pair.$1)
+                ..putString(0x02, pair.$2),
+            ),
+            (
+              _cmdDataSyncDictData,
+              HuaweiTLV()
+                ..putString(0x01, pair.$1)
+                ..putString(0x02, pair.$2),
+            ),
+          ];
+          for (final req in requests) {
+            await _writeLiveRequest(
+              deviceId: deviceId,
+              serviceId: _serviceDataSync,
+              commandId: req.$1,
+              tlv: req.$2,
+              forceEncrypted: enc,
+            );
+          }
+          return;
+        } catch (_) {
+          // Continue probing next candidate.
+        }
+      }
+    }
+
+    debugPrint('⚠️ [LIVE] DataSync bootstrap rejected for all candidate profiles');
+  }
+
+  HuaweiTLV _buildDataSyncConfigTlv({
+    required String srcPackage,
+    required String dstPackage,
+  }) {
+    final nowSec = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final goalData = HuaweiTLV()
+      ..putInt(0x01, nowSec)
+      ..putInt(0x02, 10000);
+    final configItem = HuaweiTLV()
+      ..putInt(0x05, _dataSyncStepsGoalConfigId)
+      ..putByte(0x06, 0x01)
+      ..putBytes(0x07, goalData.serialize());
+    final configList = HuaweiTLV()..putBytes(0x84, configItem.serialize());
+    return HuaweiTLV()
+      ..putString(0x01, srcPackage)
+      ..putString(0x02, dstPackage)
+      ..putBytes(0x83, configList.serialize());
+  }
+
+  HuaweiTLV _buildDataSyncConfigTlvMinimal({
+    required String srcPackage,
+    required String dstPackage,
+  }) {
+    return HuaweiTLV()
+      ..putString(0x01, srcPackage)
+      ..putString(0x02, dstPackage);
+  }
+
+  void _consumeDataSyncPacket(HuaweiPacket packet, HuaweiTLV tlv) {
+    final status = _safeGetUnsignedInt(tlv, 0x7F, maxBytes: 4);
+    debugPrint(
+      '🫀 [LIVE] DataSync packet cmd=${packet.commandId} status=${status ?? "-"}',
+    );
+    if (status == _statusUnsupported) {
+      return;
+    }
+    if (packet.commandId < _cmdDataSyncConfig ||
+        packet.commandId > _cmdDataSyncDictData) {
+      return;
+    }
+    _dataSyncBootstrapDone = true;
+    final metrics = _extractMetricsFromDataSyncPacket(packet, tlv);
+    if (metrics == null) return;
+    int? steps = metrics.$1;
+    final heartRate = _normalizeHeartRate(metrics.$2);
+    final currentSteps = _latestLiveMetrics.steps;
+    if (steps != null && steps == 0 && (currentSteps ?? 0) > 0) {
+      steps = null;
+    }
+    if (steps != null && currentSteps != null && steps < currentSteps) {
+      steps = null;
+    }
+    if (steps == null && heartRate == null) return;
+    _latestLiveMetrics = _latestLiveMetrics.copyWith(
+      deviceId: _liveMetricsDeviceId,
+      isConnected: true,
+      heartRate: heartRate,
+      steps: steps,
+    );
+    _liveMetricsController.add(_latestLiveMetrics);
+  }
+
+  (int?, int?)? _extractMetricsFromDataSyncPacket(
+    HuaweiPacket packet,
+    HuaweiTLV tlv,
+  ) {
+    final blobs = <Uint8List>[];
+
+    if (packet.commandId == _cmdDataSyncEvent && tlv.containsTag(0x05)) {
+      final eventData = _safeGetBytes(tlv, 0x05);
+      if (eventData != null && eventData.isNotEmpty) {
+        blobs.add(eventData);
+      }
+    }
+
+    if (packet.commandId == _cmdDataSyncConfig && tlv.containsTag(0x83)) {
+      final listContainer = _safeGetBytes(tlv, 0x83);
+      if (listContainer != null && listContainer.isNotEmpty) {
+        final listTlv = _tryParseTlv(listContainer);
+        if (listTlv != null) {
+          for (final item in listTlv.entries) {
+            if (item.tag != 0x84 || item.value.isEmpty) continue;
+            final itemTlv = _tryParseTlv(item.value);
+            if (itemTlv == null) continue;
+            final configData = _safeGetBytes(itemTlv, 0x07);
+            if (configData != null && configData.isNotEmpty) {
+              blobs.add(configData);
+            }
+          }
+        }
+      }
+    }
+
+    if (tlv.containsTag(0x81)) {
+      final data = _safeGetBytes(tlv, 0x81);
+      if (data != null && data.isNotEmpty) {
+        blobs.add(data);
+      }
+    }
+
+    int? steps;
+    int? heartRate;
+    void absorb((int?, int?)? metric) {
+      if (metric == null) return;
+      final s = metric.$1;
+      final h = metric.$2;
+      if (s != null && s > 0 && (steps == null || s > steps!)) {
+        steps = s;
+      }
+      final normalizedHeart = _normalizeHeartRate(h);
+      if (normalizedHeart != null) {
+        heartRate = normalizedHeart;
+      }
+    }
+
+    absorb(_extractMetricsFromDataSyncTlvTree(tlv, depth: 0));
+    for (final blob in blobs) {
+      final nestedTlv = _tryParseTlv(blob);
+      if (nestedTlv != null) {
+        absorb(_extractMetricsFromDataSyncTlvTree(nestedTlv, depth: 1));
+      } else {
+        final fallback = _parseStepDataPayload(blob);
+        absorb(fallback == null ? null : (fallback.$1, fallback.$2));
+      }
+    }
+
+    if (steps == null && heartRate == null) return null;
+    return (steps, heartRate);
+  }
+
+  (int?, int?)? _extractMetricsFromDataSyncTlvTree(
+    HuaweiTLV tlv, {
+    required int depth,
+  }) {
+    if (depth > 5) return null;
+    int? steps;
+    int? heartRate;
+
+    void absorb(int? s, int? h) {
+      if (s != null && s > 0 && (steps == null || s > steps!)) {
+        steps = s;
+      }
+      final normalizedHeart = _normalizeHeartRate(h);
+      if (normalizedHeart != null) {
+        heartRate = normalizedHeart;
+      }
+    }
+
+    absorb(
+      _safeGetUnsignedInt(tlv, 0x05, maxBytes: 4),
+      _safeGetUnsignedInt(tlv, 0x01, maxBytes: 2),
+    );
+
+    for (final entry in tlv.entries) {
+      if (entry.value.isEmpty) continue;
+      if (entry.tag != 0x05 &&
+          entry.tag != 0x06 &&
+          entry.tag != 0x07 &&
+          entry.tag != 0x81 &&
+          entry.tag != 0x83 &&
+          entry.tag != 0x84) {
+        continue;
+      }
+      final nestedTlv = _tryParseTlv(entry.value);
+      if (nestedTlv != null) {
+        final nested = _extractMetricsFromDataSyncTlvTree(
+          nestedTlv,
+          depth: depth + 1,
+        );
+        absorb(nested?.$1, nested?.$2);
+      } else {
+        final payload = _parseStepDataPayload(entry.value);
+        if (payload != null) {
+          absorb(payload.$1, payload.$2);
+        }
+      }
+    }
+
+    if (steps == null && heartRate == null) return null;
+    return (steps, heartRate);
+  }
+
+  HuaweiTLV? _tryParseTlv(Uint8List bytes) {
+    try {
+      return HuaweiTLV().parse(bytes, 0, bytes.length);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  HuaweiTLV _encryptLiveRequestTlv(HuaweiTLV plainTlv) {
+    final crypto = _runtimeCrypto;
+    if (crypto == null) return plainTlv;
+    final useGcm =
+        crypto.encryptMethod == 0x01 || crypto.deviceSupportType == 0x04;
+    final iv = _nextLiveIv(crypto);
+    final cipherText = HuaweiCrypto.encrypt(
+      useGcm,
+      plainTlv.serialize(),
+      crypto.secretKey,
+      iv,
+    );
+    return HuaweiTLV()
+      ..putByte(0x7C, 0x01)
+      ..putBytes(0x7D, iv)
+      ..putBytes(0x7E, cipherText);
+  }
+
+  Uint8List _nextLiveIv(_HuaweiRuntimeCrypto crypto) {
+    if (crypto.deviceSupportType == 0x04) {
+      return HuaweiCrypto.generateNonce();
+    }
+    final iv = HuaweiCrypto.initializationVector(crypto.encryptionCounter);
+    crypto.encryptionCounter =
+        ((iv[12] << 24) | (iv[13] << 16) | (iv[14] << 8) | iv[15]) &
+        0xFFFFFFFF;
+    return iv;
+  }
 
   Future<HuaweiPairingResult> pairAndInitialize({
     required String deviceId,
@@ -1269,6 +2081,13 @@ class HuaweiBand10PairingManager {
           lastServerNonceHex: serverNonceHex,
           lastEncryptionCounter: encryptionCounter,
         );
+        _runtimeCrypto = _HuaweiRuntimeCrypto(
+          secretKey: Uint8List.fromList(secretKey),
+          encryptMethod: encryptMethod,
+          deviceSupportType: deviceSupportType,
+          encryptionCounter: encryptionCounter,
+          sliceSize: sliceSize,
+        );
         await savePairedDeviceState(session);
         return HuaweiPairingResult(
           deviceId: deviceId,
@@ -1576,6 +2395,13 @@ class HuaweiBand10PairingManager {
         lastServerNonceHex: serverNonceHex,
         lastEncryptionCounter: encryptionCounter,
       );
+      _runtimeCrypto = _HuaweiRuntimeCrypto(
+        secretKey: Uint8List.fromList(secretKey),
+        encryptMethod: encryptMethod,
+        deviceSupportType: deviceSupportType,
+        encryptionCounter: encryptionCounter,
+        sliceSize: sliceSize,
+      );
       await savePairedDeviceState(session);
       return HuaweiPairingResult(
         deviceId: deviceId,
@@ -1655,6 +2481,9 @@ class HuaweiBand10PairingManager {
   }
 
   Future<void> clearPairedDeviceState(String deviceId) async {
+    if (_liveMetricsDeviceId == deviceId) {
+      await stopLiveMetrics(disconnectDevice: true);
+    }
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_deviceStateKey(deviceId));
     final existing = prefs.getStringList(kPairedDeviceIdsKey) ?? <String>[];
