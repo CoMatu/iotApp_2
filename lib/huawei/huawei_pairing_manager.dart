@@ -5,6 +5,7 @@ import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:device_info_plus/device_info_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:universal_ble/universal_ble.dart';
 
 import 'huawei_crypto.dart';
@@ -15,12 +16,86 @@ class HuaweiPairingResult {
   final String deviceId;
   final String? productModel;
   final int? batteryLevel;
+  final HuaweiStoredSession storedSession;
 
   const HuaweiPairingResult({
     required this.deviceId,
     required this.productModel,
     required this.batteryLevel,
+    required this.storedSession,
   });
+}
+
+class HuaweiStoredSession {
+  final String deviceId;
+  final int pairedAtMs;
+  final int lastSeenAtMs;
+  final int? mtu;
+  final int? sliceSize;
+  final int? authVersion;
+  final int? deviceSupportType;
+  final int? authAlgo;
+  final int? encryptMethod;
+  final String? productModel;
+  final int? lastBatteryLevel;
+  final String? lastServerNonceHex;
+  final int? lastEncryptionCounter;
+
+  const HuaweiStoredSession({
+    required this.deviceId,
+    required this.pairedAtMs,
+    required this.lastSeenAtMs,
+    required this.mtu,
+    required this.sliceSize,
+    required this.authVersion,
+    required this.deviceSupportType,
+    required this.authAlgo,
+    required this.encryptMethod,
+    required this.productModel,
+    required this.lastBatteryLevel,
+    required this.lastServerNonceHex,
+    required this.lastEncryptionCounter,
+  });
+
+  Map<String, Object?> toJson() => {
+    'deviceId': deviceId,
+    'pairedAtMs': pairedAtMs,
+    'lastSeenAtMs': lastSeenAtMs,
+    'mtu': mtu,
+    'sliceSize': sliceSize,
+    'authVersion': authVersion,
+    'deviceSupportType': deviceSupportType,
+    'authAlgo': authAlgo,
+    'encryptMethod': encryptMethod,
+    'productModel': productModel,
+    'lastBatteryLevel': lastBatteryLevel,
+    'lastServerNonceHex': lastServerNonceHex,
+    'lastEncryptionCounter': lastEncryptionCounter,
+  };
+
+  static HuaweiStoredSession? fromJson(Map<String, dynamic> json) {
+    final deviceId = json['deviceId'];
+    final pairedAtMs = json['pairedAtMs'];
+    final lastSeenAtMs = json['lastSeenAtMs'];
+    if (deviceId is! String || pairedAtMs is! int || lastSeenAtMs is! int) {
+      return null;
+    }
+    return HuaweiStoredSession(
+      deviceId: deviceId,
+      pairedAtMs: pairedAtMs,
+      lastSeenAtMs: lastSeenAtMs,
+      mtu: json['mtu'] as int?,
+      sliceSize: json['sliceSize'] as int?,
+      authVersion: json['authVersion'] as int?,
+      deviceSupportType: json['deviceSupportType'] as int?,
+      authAlgo: json['authAlgo'] as int?,
+      encryptMethod: json['encryptMethod'] as int?,
+      productModel: json['productModel'] as String?,
+      lastBatteryLevel: json['lastBatteryLevel'] as int?,
+      lastServerNonceHex: json['lastServerNonceHex'] as String?,
+      lastEncryptionCounter: json['lastEncryptionCounter'] as int?,
+    );
+  }
 }
 
 class HuaweiBand10PairingManager {
@@ -34,6 +109,7 @@ class HuaweiBand10PairingManager {
 
   // Used for persistence between app restarts.
   static const String kPairedDeviceIdsKey = 'huawei_paired_device_ids';
+  static const String _kLastPairedDeviceIdKey = 'huawei_last_paired_device_id';
 
   // DeviceConfig = 0x01 serviceId.
   static const int _serviceId = 0x01;
@@ -124,6 +200,7 @@ class HuaweiBand10PairingManager {
   Future<HuaweiPairingResult> pairAndInitialize({
     required String deviceId,
     Duration timeout = const Duration(seconds: 12),
+    HuaweiStoredSession? storedSession,
   }) async {
     String shortDeviceId(String id) {
       // MAC-like IDs are long; shorten to make logs readable.
@@ -158,12 +235,13 @@ class HuaweiBand10PairingManager {
     }
 
     Uint8List? secretKey; // authkey generated per session.
-    int sliceSize = 0x00F4; // default value before LinkParams.
-    int mtu = 0;
-    int authVersion = 0;
-    int deviceSupportType = 0;
-    int authAlgo = 0;
-    int encryptMethod = 0;
+    int sliceSize = storedSession?.sliceSize ?? 0x00F4;
+    int mtu = storedSession?.mtu ?? 0;
+    int authVersion = storedSession?.authVersion ?? 0;
+    int deviceSupportType = storedSession?.deviceSupportType ?? 0;
+    int authAlgo = storedSession?.authAlgo ?? 0;
+    int encryptMethod = storedSession?.encryptMethod ?? 0;
+    String? serverNonceHex;
 
     // From HuaweiSupportProvider: authMode is 0x02 for HiChainLite, otherwise 0.
     int authMode = 0;
@@ -376,6 +454,7 @@ class HuaweiBand10PairingManager {
       final link05 = linkTlv.getBytes(0x05);
       authVersion = link05[1];
       final serverNonce = Uint8List.fromList(link05.sublist(2, 18));
+      serverNonceHex = hex(serverNonce);
 
       deviceSupportType = linkTlv.getByte(0x07);
       // Some firmwares may omit optional tags; keep defaults instead of crashing.
@@ -1174,10 +1253,28 @@ class HuaweiBand10PairingManager {
           throw StateError('Init did not return BatteryLevel');
         }
 
+        final nowMs = DateTime.now().millisecondsSinceEpoch;
+        final session = HuaweiStoredSession(
+          deviceId: deviceId,
+          pairedAtMs: storedSession?.pairedAtMs ?? nowMs,
+          lastSeenAtMs: nowMs,
+          mtu: mtu,
+          sliceSize: sliceSize,
+          authVersion: authVersion,
+          deviceSupportType: deviceSupportType,
+          authAlgo: authAlgo,
+          encryptMethod: encryptMethod,
+          productModel: productModel,
+          lastBatteryLevel: batteryLevel,
+          lastServerNonceHex: serverNonceHex,
+          lastEncryptionCounter: encryptionCounter,
+        );
+        await savePairedDeviceState(session);
         return HuaweiPairingResult(
           deviceId: deviceId,
           productModel: productModel,
           batteryLevel: batteryLevel,
+          storedSession: session,
         );
       }
 
@@ -1463,10 +1560,28 @@ class HuaweiBand10PairingManager {
         throw StateError('Init did not return BatteryLevel');
       }
 
+      final nowMs = DateTime.now().millisecondsSinceEpoch;
+      final session = HuaweiStoredSession(
+        deviceId: deviceId,
+        pairedAtMs: storedSession?.pairedAtMs ?? nowMs,
+        lastSeenAtMs: nowMs,
+        mtu: mtu,
+        sliceSize: sliceSize,
+        authVersion: authVersion,
+        deviceSupportType: deviceSupportType,
+        authAlgo: authAlgo,
+        encryptMethod: encryptMethod,
+        productModel: productModel,
+        lastBatteryLevel: batteryLevel,
+        lastServerNonceHex: serverNonceHex,
+        lastEncryptionCounter: encryptionCounter,
+      );
+      await savePairedDeviceState(session);
       return HuaweiPairingResult(
         deviceId: deviceId,
         productModel: productModel,
         batteryLevel: batteryLevel,
+        storedSession: session,
       );
     } catch (e, st) {
       failed = true;
@@ -1487,6 +1602,84 @@ class HuaweiBand10PairingManager {
         } catch (_) {}
       }
     }
+  }
+
+  String _deviceStateKey(String deviceId) =>
+      'huawei_paired_device_state_${Uri.encodeComponent(deviceId)}';
+
+  Future<void> savePairedDeviceState(HuaweiStoredSession session) async {
+    final prefs = await SharedPreferences.getInstance();
+    final stateKey = _deviceStateKey(session.deviceId);
+    await prefs.setString(stateKey, jsonEncode(session.toJson()));
+
+    final existing = prefs.getStringList(kPairedDeviceIdsKey) ?? <String>[];
+    if (!existing.contains(session.deviceId)) {
+      final updated = <String>[...existing, session.deviceId];
+      await prefs.setStringList(kPairedDeviceIdsKey, updated);
+    }
+    await prefs.setString(_kLastPairedDeviceIdKey, session.deviceId);
+  }
+
+  Future<HuaweiStoredSession?> loadPairedDeviceState(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_deviceStateKey(deviceId));
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map<String, dynamic>) return null;
+      return HuaweiStoredSession.fromJson(decoded);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<List<HuaweiStoredSession>> loadAllPairedDeviceStates() async {
+    final prefs = await SharedPreferences.getInstance();
+    final ids = prefs.getStringList(kPairedDeviceIdsKey) ?? <String>[];
+    final result = <HuaweiStoredSession>[];
+    for (final id in ids) {
+      final state = await loadPairedDeviceState(id);
+      if (state != null) {
+        result.add(state);
+      }
+    }
+    result.sort((a, b) => b.lastSeenAtMs.compareTo(a.lastSeenAtMs));
+    return result;
+  }
+
+  Future<String?> loadLastPairedDeviceId() async {
+    final prefs = await SharedPreferences.getInstance();
+    final id = prefs.getString(_kLastPairedDeviceIdKey);
+    if (id == null || id.isEmpty) return null;
+    return id;
+  }
+
+  Future<void> clearPairedDeviceState(String deviceId) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_deviceStateKey(deviceId));
+    final existing = prefs.getStringList(kPairedDeviceIdsKey) ?? <String>[];
+    final updated = existing.where((id) => id != deviceId).toList();
+    await prefs.setStringList(kPairedDeviceIdsKey, updated);
+    final lastId = prefs.getString(_kLastPairedDeviceIdKey);
+    if (lastId == deviceId) {
+      if (updated.isNotEmpty) {
+        await prefs.setString(_kLastPairedDeviceIdKey, updated.last);
+      } else {
+        await prefs.remove(_kLastPairedDeviceIdKey);
+      }
+    }
+  }
+
+  Future<HuaweiPairingResult> restoreConnection({
+    required String deviceId,
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    final state = await loadPairedDeviceState(deviceId);
+    return pairAndInitialize(
+      deviceId: deviceId,
+      timeout: timeout,
+      storedSession: state,
+    );
   }
 
   Future<String?> _getAndroidId() async {
