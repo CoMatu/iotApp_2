@@ -1217,6 +1217,7 @@ class HuaweiBand10PairingManager {
       }) async {
         for (var attempt = 1; attempt <= maxRetries + 1; attempt++) {
           debugPrint('🧪 [PAIR] $step attempt $attempt');
+          final responseFuture = waitPacket(serviceId, commandId);
           await sendPacket(
             serviceId: serviceId,
             commandId: commandId,
@@ -1225,7 +1226,7 @@ class HuaweiBand10PairingManager {
             isSliced: isSliced,
           );
           try {
-            final packet = await waitPacket(serviceId, commandId);
+            final packet = await responseFuture;
             debugPrint(
               '✅ [PAIR] $step response received (service=${serviceId.toRadixString(16)} cmd=${commandId.toRadixString(16)})',
             );
@@ -1534,11 +1535,28 @@ class HuaweiBand10PairingManager {
           final lastBrace = jsonStr.lastIndexOf('}');
           if (firstBrace >= 0 && lastBrace > firstBrace) {
             jsonStr = jsonStr.substring(firstBrace, lastBrace + 1);
+          } else {
+            // Some Step4 bind responses carry plain app id (e.g. com.huawei.health)
+            // instead of JSON payload.
+            return <String, dynamic>{'payloadRaw': jsonStr.trim()};
           }
 
-          final decoded = jsonDecode(jsonStr) as Map<String, dynamic>;
-          final payload = decoded['payload'] as Map<String, dynamic>;
-          return payload;
+          try {
+            final decoded = jsonDecode(jsonStr);
+            if (decoded is Map<String, dynamic>) {
+              final payload = decoded['payload'];
+              if (payload is Map<String, dynamic>) {
+                return payload;
+              }
+              if (payload != null) {
+                return <String, dynamic>{'payloadRaw': payload};
+              }
+              return decoded;
+            }
+            return <String, dynamic>{'payloadRaw': decoded};
+          } on FormatException {
+            return <String, dynamic>{'payloadRaw': jsonStr.trim()};
+          }
         }
 
         Uint8List hkdfInfoSession = Uint8List.fromList(
@@ -1898,6 +1916,7 @@ class HuaweiBand10PairingManager {
 
         // Некоторые прошивки могут не прислать ответ на Step4, но мы ждём его
         // в тех же рамках, что и раньше (и для Band10 это критично).
+        final step4ResponseFuture = waitPacket(_serviceId, _cmdHiChain);
         await sendPacket(
           serviceId: _serviceId,
           commandId: _cmdHiChain,
@@ -1906,7 +1925,7 @@ class HuaweiBand10PairingManager {
           isSliced: true,
         );
         try {
-          final step4RespPkt = await waitPacket(_serviceId, _cmdHiChain);
+          final step4RespPkt = await step4ResponseFuture;
           try {
             final payload4 = parseHiChainPayload(step4RespPkt.tlv);
             debugPrint(

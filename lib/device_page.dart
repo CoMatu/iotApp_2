@@ -68,7 +68,9 @@ class _DevicePageState extends State<DevicePage> {
         // Ignore stop scan errors (e.g. scan already stopped).
       }
 
-      final result = await _manager.pairAndInitialize(deviceId: widget.deviceId);
+      final result = await _manager.pairAndInitialize(
+        deviceId: widget.deviceId,
+      );
       if (!mounted) return;
       setState(() {
         // pairing считаем успешным только при наличии критичных данных.
@@ -100,21 +102,23 @@ class _DevicePageState extends State<DevicePage> {
         await UniversalBle.stopScan();
       } catch (_) {}
 
-      final result = await _manager.restoreConnection(deviceId: widget.deviceId);
+      final result = await _manager.restoreConnection(
+        deviceId: widget.deviceId,
+      );
       if (!mounted) return;
       setState(() {
         _isPaired = (result.batteryLevel != null);
         _productModel = result.productModel;
         _batteryLevel = result.batteryLevel;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Connection restored')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Connection restored')));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Restore failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Restore failed: $e')));
     } finally {
       if (mounted) {
         setState(() => _isRestoring = false);
@@ -221,7 +225,8 @@ class _DevicePageState extends State<DevicePage> {
                       ? 'Restoring...'
                       : (_isPaired == true ? 'Готово' : 'Pair'),
                 ),
-                onPressed: (_isPairing ||
+                onPressed:
+                    (_isPairing ||
                         _isRestoring ||
                         _isUnpairing ||
                         _isPaired == true)
@@ -231,12 +236,18 @@ class _DevicePageState extends State<DevicePage> {
             ),
           ),
           Padding(
-            padding: const EdgeInsets.only(left: 16.0, right: 16.0, bottom: 12.0),
+            padding: const EdgeInsets.only(
+              left: 16.0,
+              right: 16.0,
+              bottom: 12.0,
+            ),
             child: SizedBox(
               width: double.infinity,
               child: ElevatedButton.icon(
                 icon: const Icon(Icons.refresh),
-                label: Text(_isRestoring ? 'Restoring...' : 'Восстановить соединение'),
+                label: Text(
+                  _isRestoring ? 'Restoring...' : 'Восстановить соединение',
+                ),
                 onPressed: (_isPairing || _isRestoring || _isUnpairing)
                     ? null
                     : _restoreConnection,
@@ -256,7 +267,10 @@ class _DevicePageState extends State<DevicePage> {
                   icon: const Icon(Icons.bluetooth_disabled),
                   label: Text(_isUnpairing ? 'Unpairing...' : 'Unpair'),
                   onPressed:
-                      (_isPairing || _isRestoring || _isUnpairing || _isPaired != true)
+                      (_isPairing ||
+                          _isRestoring ||
+                          _isUnpairing ||
+                          _isPaired != true)
                       ? null
                       : _unpair,
                 ),

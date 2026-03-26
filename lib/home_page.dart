@@ -111,24 +111,27 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              spacing: 8,
               children: [
-                OutlinedButton(
-                  style: OutlinedButton.styleFrom(
-                    backgroundColor: Theme.of(context).colorScheme.primary,
-                    foregroundColor: Theme.of(context).colorScheme.onPrimary,
+                Expanded(
+                  child: OutlinedButton(
+                    style: OutlinedButton.styleFrom(
+                      backgroundColor: Theme.of(context).colorScheme.primary,
+                      foregroundColor: Theme.of(context).colorScheme.onPrimary,
+                    ),
+                    onPressed: () {
+                      _scanDevices();
+                    },
+                    child: Text(_isScanning ? 'Stop scanning' : 'Scan devices'),
                   ),
-                  onPressed: () {
-                    _scanDevices();
-                  },
-                  child: Text(_isScanning ? 'Stop scanning' : 'Scan devices'),
                 ),
-                OutlinedButton.icon(
-                  onPressed: (_isRestoringSaved || _lastStoredSession == null)
-                      ? null
-                      : _restoreLastConnection,
-                  icon: const Icon(Icons.refresh),
-                  label: Text(
-                    _isRestoringSaved ? 'Restoring...' : 'Восстановить',
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: (_isRestoringSaved || _lastStoredSession == null)
+                        ? null
+                        : _restoreLastConnection,
+                    icon: const Icon(Icons.refresh),
+                    label: Text(_isRestoringSaved ? 'Restoring...' : 'Restore'),
                   ),
                 ),
               ],
@@ -268,7 +271,8 @@ class _MyHomePageState extends State<MyHomePage> {
                 itemCount: _bleDevices.length,
                 itemBuilder: (context, index) {
                   return ListTile(
-                    onTap: () {
+                    onTap: () async {
+                      // _bleDevices[index].pair();
                       final deviceId = _bleDevices[index].deviceId.toString();
                       // Используем `push`, чтобы маршрут устройства добавлялся в историю,
                       // и системная кнопка "Назад" возвращала на предыдущий экран.
