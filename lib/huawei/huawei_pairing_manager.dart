@@ -3,7 +3,6 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
-import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -12,8 +11,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:universal_ble/universal_ble.dart';
 
 import 'huawei_crypto.dart';
+import 'huawei_hichain3.dart';
 import 'huawei_packet_codec.dart';
 import 'huawei_tlv.dart';
+import 'huawei_capabilities.dart';
 
 class HuaweiPairingResult {
   final String deviceId;
@@ -160,6 +161,16 @@ class _HuaweiRuntimeCrypto {
   });
 }
 
+class _HuaweiInitResult {
+  final String? productModel;
+  final int batteryLevel;
+
+  const _HuaweiInitResult({
+    required this.productModel,
+    required this.batteryLevel,
+  });
+}
+
 class HuaweiBand10PairingManager {
   static const MethodChannel _androidBondChannel = MethodChannel(
     'iot_monitor_2/android_ble_bond',
@@ -216,71 +227,11 @@ class HuaweiBand10PairingManager {
   static const int _dataSyncStepsGoalConfigId = 900200006;
 
   // ProductInfo tags for non-AW devices.
-  static const List<int> _productInfoTagsNormal = [
-    0x01,
-    0x02,
-    0x07,
-    0x09,
-    0x0A,
-    0x11,
-    0x12,
-    0x16,
-    0x1A,
-    0x1D,
-    0x1E,
-    0x1F,
-    0x20,
-    0x21,
-    0x22,
-    0x23,
-  ];
+  static const List<int> _productInfoTagsNormal = kHuaweiProductInfoTagsNormal;
 
   // From DeviceConfig.SupportedServices.knownSupportedServices.
-  static const List<int> _knownSupportedServices = [
-    0x02,
-    0x03,
-    0x04,
-    0x05,
-    0x06,
-    0x07,
-    0x08,
-    0x09,
-    0x0A,
-    0x0B,
-    0x0C,
-    0x0D,
-    0x0E,
-    0x0F,
-    0x10,
-    0x11,
-    0x12,
-    0x13,
-    0x14,
-    0x15,
-    0x16,
-    0x17,
-    0x18,
-    0x19,
-    0x1A,
-    0x1B,
-    0x1D,
-    0x20,
-    0x22,
-    0x23,
-    0x24,
-    0x25,
-    0x26,
-    0x27,
-    0x2A,
-    0x2B,
-    0x2D,
-    0x2E,
-    0x30,
-    0x32,
-    0x33,
-    0x34,
-    0x35,
-  ];
+  static const List<int> _knownSupportedServices =
+      kHuaweiKnownSupportedServices;
 
   final StreamController<HuaweiLiveMetrics> _liveMetricsController =
       StreamController<HuaweiLiveMetrics>.broadcast();
@@ -1774,6 +1725,640 @@ class HuaweiBand10PairingManager {
         throw StateError('$step failed');
       }
 
+      Future<_HuaweiInitResult> runPostBondInit() async {
+        // 7) Init: ProductInfo/Battery/SupportedServices (and TimeRequest)
+        stage = 'Init: ProductInfo (0x01/0x07)';
+        debugPrint('🧾 [PAIR] Request ProductInfo');
+        final productTlv = HuaweiTLV();
+        for (final t in _productInfoTagsNormal) {
+          productTlv.putTag(t);
+        }
+        final productPacket = await sendAndWait(
+          step: 'ProductInfo',
+          serviceId: _serviceId,
+          commandId: _cmdProductInfo,
+          tlv: productTlv,
+          encryptedTlV: true,
+          isSliced: true,
+        );
+        final productTlvResp = decryptIfNeeded(productPacket.tlv);
+        final productModelBytes = productTlvResp.containsTag(0x0A)
+            ? productTlvResp.getBytes(0x0A)
+            : null;
+        final productModel = productModelBytes == null
+            ? null
+            : utf8.decode(productModelBytes).trim();
+        debugPrint(
+          '🏷️ [PAIR] ProductInfo parsed (model=${productModel ?? 'null'})',
+        );
+
+        // TimeRequest (ignore response).
+        stage = 'Init: TimeRequest (0x01/0x05)';
+        debugPrint('⏰ [PAIR] Send TimeRequest (response optional)');
+        await sendPacket(
+          serviceId: _serviceId,
+          commandId: _cmdTimeRequest,
+          tlv: _timeRequestTlv(),
+          encryptedTlV: true,
+          isSliced: true,
+        );
+        try {
+          await waitPacket(_serviceId, _cmdTimeRequest);
+        } catch (_) {}
+
+        // BatteryLevel.
+        stage = 'Init: BatteryLevel (0x01/0x08)';
+        debugPrint('🔋 [PAIR] Request BatteryLevel');
+        final batteryPacket = await sendAndWait(
+          step: 'BatteryLevel',
+          serviceId: _serviceId,
+          commandId: _cmdBatteryLevel,
+          tlv: HuaweiTLV()..putTag(0x01),
+          encryptedTlV: true,
+          isSliced: true,
+        );
+        final batteryTlvResp = decryptIfNeeded(batteryPacket.tlv);
+        int? batteryLevel = extractBatteryLevelFromTlv(batteryTlvResp);
+
+        // Some firmwares may return only ACK/status for the initial request.
+        if (batteryLevel == null) {
+          debugPrint(
+            '🔋 [PAIR] BatteryLevel tag 0x01 missing, waiting async BatteryLevel (0x01/0x27)...',
+          );
+          try {
+            final batteryChangePacket = await waitPacket(
+              _serviceId,
+              _cmdBatteryLevelChange,
+            );
+            final batteryChangeTlvResp = decryptIfNeeded(
+              batteryChangePacket.tlv,
+            );
+            debugPrint(
+              '🔋 [PAIR] BatteryLevel change decrypted tags: has01=${batteryChangeTlvResp.containsTag(0x01)} has02=${batteryChangeTlvResp.containsTag(0x02)} has03=${batteryChangeTlvResp.containsTag(0x03)}',
+            );
+            batteryLevel = extractBatteryLevelFromTlv(batteryChangeTlvResp);
+          } catch (_) {
+            batteryLevel = null;
+          }
+        }
+
+        if (batteryLevel == null) {
+          debugPrint(
+            '🔋 [PAIR] BatteryLevel still missing, waiting another BatteryLevel (0x01/0x08)...',
+          );
+          try {
+            final batteryPacket2 = await waitPacket(_serviceId, _cmdBatteryLevel);
+            final batteryTlvResp2 = decryptIfNeeded(batteryPacket2.tlv);
+            batteryLevel = extractBatteryLevelFromTlv(batteryTlvResp2);
+          } catch (_) {
+            batteryLevel = null;
+          }
+        }
+        debugPrint('🔋 [PAIR] BatteryLevel parsed (${batteryLevel ?? "null"})');
+
+        // SupportedServices (must be last in gadgetbridge).
+        stage = 'Init: SupportedServices (0x01/0x02)';
+        debugPrint('🧰 [PAIR] Send SupportedServices');
+        await sendPacket(
+          serviceId: _serviceId,
+          commandId: _cmdSupportedServices,
+          tlv: HuaweiTLV()..putBytes(0x01, huaweiKnownSupportedServicesBytes()),
+          encryptedTlV: true,
+          isSliced: true,
+        );
+        try {
+          await waitPacket(_serviceId, _cmdSupportedServices);
+        } catch (_) {}
+
+        if (batteryLevel == null || batteryLevel <= 0) {
+          throw StateError('Init did not return BatteryLevel');
+        }
+
+        return _HuaweiInitResult(
+          productModel: productModel,
+          batteryLevel: batteryLevel,
+        );
+      }
+
+      Future<HuaweiPairingResult> buildAndPersistPairingResult({
+        required String? productModel,
+        required int batteryLevel,
+      }) async {
+        if (secretKey == null) {
+          throw StateError('secretKey is null before persisting pairing result');
+        }
+        final nowMs = DateTime.now().millisecondsSinceEpoch;
+        final session = HuaweiStoredSession(
+          deviceId: deviceId,
+          pairedAtMs: storedSession?.pairedAtMs ?? nowMs,
+          lastSeenAtMs: nowMs,
+          mtu: mtu,
+          sliceSize: sliceSize,
+          authVersion: authVersion,
+          deviceSupportType: deviceSupportType,
+          authAlgo: authAlgo,
+          encryptMethod: encryptMethod,
+          productModel: productModel,
+          lastBatteryLevel: batteryLevel,
+          lastServerNonceHex: serverNonceHex,
+          lastEncryptionCounter: encryptionCounter,
+        );
+        _runtimeCrypto = _HuaweiRuntimeCrypto(
+          secretKey: Uint8List.fromList(secretKey),
+          encryptMethod: encryptMethod,
+          deviceSupportType: deviceSupportType,
+          encryptionCounter: encryptionCounter,
+          sliceSize: sliceSize,
+        );
+        await savePairedDeviceState(session);
+        return HuaweiPairingResult(
+          deviceId: deviceId,
+          productModel: productModel,
+          batteryLevel: batteryLevel,
+          storedSession: session,
+        );
+      }
+
+      Future<Uint8List> requestHiChain3PinCode() async {
+        stage = 'PinCode (0x01/0x2C) [HiChain3]';
+        debugPrint('🧩 [PAIR] Request PinCode for HiChain3');
+
+        final pinPacket = await sendAndWait(
+          step: 'PinCode',
+          serviceId: _serviceId,
+          commandId: _cmdPinCode,
+          tlv: HuaweiTLV()..putTag(0x01),
+          encryptedTlV: false,
+          isSliced: true,
+        );
+        final pinTlv = decryptIfNeeded(pinPacket.tlv);
+        final pinMessage = pinTlv.getBytes(0x01);
+        final pinIv = pinTlv.getBytes(0x02);
+        final pinCrypto = HuaweiCrypto(
+          authVersion,
+          authAlgo,
+          deviceSupportType,
+          authMode,
+        );
+        final pin = pinCrypto.decryptPinCode(encryptMethod, pinMessage, pinIv);
+        debugPrint('🔑 [PAIR] PinCode decrypted (len=${pin.length})');
+        return pin;
+      }
+
+      Future<HuaweiPairingResult> runInitAndPersistResult() async {
+        final initResult = await runPostBondInit();
+        return buildAndPersistPairingResult(
+          productModel: initResult.productModel,
+          batteryLevel: initResult.batteryLevel,
+        );
+      }
+
+      ({
+        Uint8List hkdfInfoSession,
+        Uint8List hkdfInfoReturn,
+        Uint8List aadIsoExchange,
+        Uint8List aadIsoResult,
+      })
+      createHiChain3Params() {
+        return (
+          hkdfInfoSession: Uint8List.fromList(
+            utf8.encode('hichain_iso_session_key'),
+          ),
+          hkdfInfoReturn: Uint8List.fromList(utf8.encode('hichain_return_key')),
+          aadIsoExchange: Uint8List.fromList(utf8.encode('hichain_iso_exchange')),
+          aadIsoResult: Uint8List.fromList(utf8.encode('hichain_iso_result')),
+        );
+      }
+
+      Future<Uint8List> runHiChain3AuthFlow({
+        required Uint8List selfAuthId,
+        required Uint8List pinCodeBytes,
+        required Uint8List hkdfInfoSession,
+        required Uint8List aadIsoExchange,
+        required Uint8List aadIsoResult,
+      }) async {
+        stage = 'HiChain3 auth (0x01/0x28)';
+        final int requestIdAuth = DateTime.now().millisecondsSinceEpoch;
+        final Uint8List seedAuth = HuaweiHiChain3.randomBytes(32);
+        final Uint8List randSelfAuth = HuaweiHiChain3.randomBytes(16);
+
+        // Step 1 (auth)
+        final step1AuthPkt = await sendAndWait(
+          step: 'HiChain3 Auth Step1',
+          serviceId: _serviceId,
+          commandId: _cmdHiChain,
+          tlv: HuaweiHiChain3.buildHiChainRequestTlv(
+            selfAuthId: selfAuthId,
+            operationCode: 0x01,
+            requestId: requestIdAuth,
+            messageId: 0x01,
+            payloadExtra: {
+              'isoSalt': hex(randSelfAuth),
+              'peerAuthId': hex(selfAuthId),
+              'operationCode': 0x01,
+              'seed': hex(seedAuth),
+              'peerUserType': 0x00,
+            },
+            outerExtra: const {},
+          ),
+          encryptedTlV: false,
+          isSliced: true,
+        );
+
+        final payload1Auth = HuaweiHiChain3.parseHiChainPayload(step1AuthPkt.tlv);
+        final isoSaltHexAuth = payload1Auth['isoSalt'] as String?;
+        final peerAuthIdHexAuth = payload1Auth['peerAuthId'] as String?;
+        final tokenHexAuth = payload1Auth['token'] as String?;
+        final errCode1 = payload1Auth['errorCode'];
+        if (isoSaltHexAuth == null ||
+            peerAuthIdHexAuth == null ||
+            tokenHexAuth == null) {
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 auth step1 payload parse issue: keys=${payload1Auth.keys} errorCode=$errCode1 payload=$payload1Auth',
+          );
+          throw StateError('HiChain3 auth step1 missing isoSalt/peerAuthId/token');
+        }
+        final Uint8List randPeerAuth = HuaweiHiChain3.hexToBytes(isoSaltHexAuth);
+        final Uint8List authIdPeerAuth = HuaweiHiChain3.hexToBytes(
+          peerAuthIdHexAuth,
+        );
+        final Uint8List peerTokenAuth = HuaweiHiChain3.hexToBytes(tokenHexAuth);
+
+        // psk = HMAC( digest(pinCodeHexBytes), seed )
+        final pinHexUpper = hex(pinCodeBytes);
+        final pinKey = HuaweiCrypto.sha256Bytes(
+          Uint8List.fromList(utf8.encode(pinHexUpper)),
+        );
+        final Uint8List pskAuth = HuaweiCrypto.hmacSha256(pinKey, seedAuth);
+
+        final peerMsgAuth = HuaweiHiChain3.concatBytes([
+          randPeerAuth,
+          randSelfAuth,
+          selfAuthId,
+          authIdPeerAuth,
+        ]);
+        final tokenCheckAuth = HuaweiCrypto.hmacSha256(pskAuth, peerMsgAuth);
+        if (!listEquals(tokenCheckAuth, peerTokenAuth)) {
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 auth peerToken mismatch; computed=${hex(tokenCheckAuth)} device=${hex(peerTokenAuth)}',
+          );
+        }
+
+        final selfMsgAuth = HuaweiHiChain3.concatBytes([
+          randSelfAuth,
+          randPeerAuth,
+          authIdPeerAuth,
+          selfAuthId,
+        ]);
+        final selfTokenAuth = HuaweiCrypto.hmacSha256(pskAuth, selfMsgAuth);
+
+        // Step 2 (auth)
+        final step2AuthPkt = await sendAndWait(
+          step: 'HiChain3 Auth Step2',
+          serviceId: _serviceId,
+          commandId: _cmdHiChain,
+          tlv: HuaweiHiChain3.buildHiChainRequestTlv(
+            selfAuthId: selfAuthId,
+            operationCode: 0x01,
+            requestId: requestIdAuth,
+            messageId: 0x02,
+            payloadExtra: {
+              'peerAuthId': hex(selfAuthId),
+              'token': hex(selfTokenAuth),
+            },
+            outerExtra: const {},
+          ),
+          encryptedTlV: false,
+          isSliced: true,
+        );
+
+        final payload2Auth = HuaweiHiChain3.parseHiChainPayload(step2AuthPkt.tlv);
+        final returnCodeMacHexAuth = payload2Auth['returnCodeMac'] as String?;
+        final errCode2 = payload2Auth['errorCode'];
+        if (returnCodeMacHexAuth == null) {
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 auth step2 payload parse issue: keys=${payload2Auth.keys} errorCode=$errCode2 payload=$payload2Auth',
+          );
+          throw StateError('HiChain3 auth step2 missing returnCodeMac');
+        }
+        final Uint8List returnCodeMacAuth = HuaweiHiChain3.hexToBytes(
+          returnCodeMacHexAuth,
+        );
+        final expectedReturnCodeMacAuth = HuaweiCrypto.hmacSha256(
+          pskAuth,
+          Uint8List(4),
+        );
+        if (!listEquals(returnCodeMacAuth, expectedReturnCodeMacAuth)) {
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 auth returnCodeMac mismatch (continuing). computed=${hex(expectedReturnCodeMacAuth)} device=${hex(returnCodeMacAuth)}',
+          );
+        }
+
+        // Step 3 (auth)
+        final Uint8List saltAuth = HuaweiHiChain3.concatBytes([
+          randSelfAuth,
+          randPeerAuth,
+        ]);
+        final Uint8List sessionKeyAuth = HuaweiCrypto.hkdfSha256(
+          secretKey: pskAuth,
+          salt: saltAuth,
+          info: hkdfInfoSession,
+          outputLength: 32,
+        );
+
+        final Uint8List nonceStep3Auth = HuaweiHiChain3.randomBytes(12);
+        final Uint8List challengeAuth = HuaweiHiChain3.randomBytes(16);
+        final Uint8List encDataAuth = HuaweiCrypto.encryptAesGcmNoPadWithAad(
+          challengeAuth,
+          sessionKeyAuth,
+          nonceStep3Auth,
+          aadIsoExchange,
+        );
+
+        final step3AuthPkt = await sendAndWait(
+          step: 'HiChain3 Auth Step3',
+          serviceId: _serviceId,
+          commandId: _cmdHiChain,
+          tlv: HuaweiHiChain3.buildHiChainRequestTlv(
+            selfAuthId: selfAuthId,
+            operationCode: 0x01,
+            requestId: requestIdAuth,
+            messageId: 0x03,
+            payloadExtra: {
+              'nonce': hex(nonceStep3Auth),
+              'encData': hex(encDataAuth),
+            },
+            outerExtra: const {},
+          ),
+          encryptedTlV: false,
+          isSliced: true,
+        );
+
+        final payload3Auth = HuaweiHiChain3.parseHiChainPayload(step3AuthPkt.tlv);
+        final Uint8List nonceRespAuth = HuaweiHiChain3.hexToBytes(
+          payload3Auth['nonce'] as String,
+        );
+        final Uint8List encAuthTokenAuth = HuaweiHiChain3.hexToBytes(
+          payload3Auth['encAuthToken'] as String,
+        );
+        final Uint8List authToken = HuaweiCrypto.decryptAesGcmNoPadWithAad(
+          encAuthTokenAuth,
+          sessionKeyAuth,
+          nonceRespAuth,
+          challengeAuth,
+        );
+
+        // Step 4 (auth)
+        final Uint8List nonceStep4Auth = HuaweiHiChain3.randomBytes(12);
+        final Uint8List encResultAuth = HuaweiCrypto.encryptAesGcmNoPadWithAad(
+          Uint8List(4),
+          sessionKeyAuth,
+          nonceStep4Auth,
+          aadIsoResult,
+        );
+
+        await sendAndWait(
+          step: 'HiChain3 Auth Step4',
+          serviceId: _serviceId,
+          commandId: _cmdHiChain,
+          tlv: HuaweiHiChain3.buildHiChainRequestTlv(
+            selfAuthId: selfAuthId,
+            operationCode: 0x01,
+            requestId: requestIdAuth,
+            messageId: 0x04,
+            payloadExtra: {
+              'nonce': hex(nonceStep4Auth),
+              'encResult': hex(encResultAuth),
+              'operationCode': 0x01,
+            },
+            outerExtra: const {},
+          ),
+          encryptedTlV: false,
+          isSliced: true,
+          maxRetries: 0,
+        );
+
+        return authToken;
+      }
+
+      Future<Uint8List> runHiChain3BindFlow({
+        required Uint8List selfAuthId,
+        required Uint8List authToken,
+        required Uint8List hkdfInfoSession,
+        required Uint8List hkdfInfoReturn,
+        required Uint8List aadIsoResult,
+      }) async {
+        stage = 'HiChain3 bind (0x01/0x28)';
+        final int requestIdBind = DateTime.now().millisecondsSinceEpoch;
+        final Uint8List seedBind = HuaweiHiChain3.randomBytes(32);
+        final Uint8List randSelfBind = HuaweiHiChain3.randomBytes(16);
+
+        // Step 1 (bind)
+        final step1BindPkt = await sendAndWait(
+          step: 'HiChain3 Bind Step1',
+          serviceId: _serviceId,
+          commandId: _cmdHiChain,
+          tlv: HuaweiHiChain3.buildHiChainRequestTlv(
+            selfAuthId: selfAuthId,
+            operationCode: 0x02,
+            requestId: requestIdBind,
+            messageId: 0x01,
+            payloadExtra: {
+              'isoSalt': hex(randSelfBind),
+              'peerAuthId': hex(selfAuthId),
+              'operationCode': 0x02,
+              'seed': hex(seedBind),
+              'peerUserType': 0x00,
+              'pkgName': 'com.huawei.devicegroupmanage',
+              'serviceType': kHuaweiHiChainServiceType,
+              'keyLength': 0x20,
+            },
+            outerExtra: const {'isDeviceLevel': false},
+          ),
+          encryptedTlV: false,
+          isSliced: true,
+        );
+
+        final payload1Bind = HuaweiHiChain3.parseHiChainPayload(step1BindPkt.tlv);
+        final isoSaltHexBind = payload1Bind['isoSalt'] as String?;
+        final peerAuthIdHexBind = payload1Bind['peerAuthId'] as String?;
+        final tokenHexBind = payload1Bind['token'] as String?;
+        final errCode1b = payload1Bind['errorCode'];
+        if (isoSaltHexBind == null ||
+            peerAuthIdHexBind == null ||
+            tokenHexBind == null) {
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 bind step1 payload parse issue: keys=${payload1Bind.keys} errorCode=$errCode1b payload=$payload1Bind',
+          );
+          throw StateError('HiChain3 bind step1 missing isoSalt/peerAuthId/token');
+        }
+        final Uint8List randPeerBind = HuaweiHiChain3.hexToBytes(isoSaltHexBind);
+        final Uint8List authIdPeerBind = HuaweiHiChain3.hexToBytes(
+          peerAuthIdHexBind,
+        );
+        final Uint8List peerTokenBind = HuaweiHiChain3.hexToBytes(tokenHexBind);
+
+        final Uint8List pskBind = HuaweiCrypto.hmacSha256(authToken, seedBind);
+        final peerMsgBind = HuaweiHiChain3.concatBytes([
+          randPeerBind,
+          randSelfBind,
+          selfAuthId,
+          authIdPeerBind,
+        ]);
+        final tokenCheckBind = HuaweiCrypto.hmacSha256(pskBind, peerMsgBind);
+        if (!listEquals(tokenCheckBind, peerTokenBind)) {
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 bind peerToken mismatch; computed=${hex(tokenCheckBind)} device=${hex(peerTokenBind)}',
+          );
+        }
+
+        final selfMsgBind = HuaweiHiChain3.concatBytes([
+          randSelfBind,
+          randPeerBind,
+          authIdPeerBind,
+          selfAuthId,
+        ]);
+        final selfTokenBind = HuaweiCrypto.hmacSha256(pskBind, selfMsgBind);
+
+        // Step 2 (bind)
+        final step2BindPkt = await sendAndWait(
+          step: 'HiChain3 Bind Step2',
+          serviceId: _serviceId,
+          commandId: _cmdHiChain,
+          tlv: HuaweiHiChain3.buildHiChainRequestTlv(
+            selfAuthId: selfAuthId,
+            operationCode: 0x02,
+            requestId: requestIdBind,
+            messageId: 0x02,
+            payloadExtra: {
+              'peerAuthId': hex(selfAuthId),
+              'token': hex(selfTokenBind),
+            },
+            outerExtra: const {'isDeviceLevel': false},
+          ),
+          encryptedTlV: false,
+          isSliced: true,
+        );
+
+        final payload2Bind = HuaweiHiChain3.parseHiChainPayload(step2BindPkt.tlv);
+        final returnCodeMacHexBind = payload2Bind['returnCodeMac'] as String?;
+        final errCode2b = payload2Bind['errorCode'];
+        if (returnCodeMacHexBind == null) {
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 bind step2 payload parse issue: keys=${payload2Bind.keys} errorCode=$errCode2b payload=$payload2Bind',
+          );
+          throw StateError('HiChain3 bind step2 missing returnCodeMac');
+        }
+        final Uint8List returnCodeMacBind = HuaweiHiChain3.hexToBytes(
+          returnCodeMacHexBind,
+        );
+        final expectedReturnCodeMacBind = HuaweiCrypto.hmacSha256(
+          pskBind,
+          Uint8List(4),
+        );
+        if (!listEquals(returnCodeMacBind, expectedReturnCodeMacBind)) {
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 bind returnCodeMac mismatch (continuing). computed=${hex(expectedReturnCodeMacBind)} device=${hex(returnCodeMacBind)}',
+          );
+        }
+
+        // Step 3 + Step 4 response.
+        final Uint8List saltBind = HuaweiHiChain3.concatBytes([
+          randSelfBind,
+          randPeerBind,
+        ]);
+        final Uint8List sessionKeyBind = HuaweiCrypto.hkdfSha256(
+          secretKey: pskBind,
+          salt: saltBind,
+          info: hkdfInfoSession,
+          outputLength: 32,
+        );
+
+        final Uint8List nonceStep3Bind = HuaweiHiChain3.randomBytes(12);
+        final Uint8List encDataBind = HuaweiCrypto.encryptAesGcmNoPadWithAad(
+          Uint8List(4),
+          sessionKeyBind,
+          nonceStep3Bind,
+          aadIsoResult,
+        );
+
+        final step3BindTlv = HuaweiHiChain3.buildHiChainRequestTlv(
+          selfAuthId: selfAuthId,
+          operationCode: 0x02,
+          requestId: requestIdBind,
+          messageId: 0x03,
+          payloadExtra: {
+            'peerAuthId': hex(selfAuthId),
+            'token': hex(selfTokenBind),
+            'encResult': hex(encDataBind),
+            'nonce': hex(nonceStep3Bind),
+            'operationCode': 0x02,
+          },
+          outerExtra: const {'isDeviceLevel': false},
+        );
+
+        final step4ResponseFuture = waitPacket(_serviceId, _cmdHiChain);
+        await sendPacket(
+          serviceId: _serviceId,
+          commandId: _cmdHiChain,
+          tlv: step3BindTlv,
+          encryptedTlV: false,
+          isSliced: true,
+        );
+        try {
+          final step4RespPkt = await step4ResponseFuture;
+          try {
+            final payload4 = HuaweiHiChain3.parseHiChainPayload(step4RespPkt.tlv);
+            debugPrint(
+              '🧾 [PAIR] HiChain3 bind Step4 payload keys=${payload4.keys} errorCode=${payload4['errorCode']} returnCodeMac=${payload4['returnCodeMac']}',
+            );
+          } catch (e) {
+            debugPrint('⚠️ [PAIR] HiChain3 bind Step4 payload parse failed: $e');
+          }
+        } on TimeoutException catch (_) {
+          if (deviceSupportType == 0x04) {
+            throw StateError(
+              'HiChain3 bind Step4 response timeout (Band10) after Step3',
+            );
+          }
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 bind Step4 response timeout after Step3, continuing...',
+          );
+        } catch (_) {
+          debugPrint(
+            '⚠️ [PAIR] HiChain3 bind Step4 response timeout after Step3, continuing...',
+          );
+        }
+
+        return HuaweiCrypto.hkdfSha256(
+          secretKey: sessionKeyBind,
+          salt: saltBind,
+          info: hkdfInfoReturn,
+          outputLength: 32,
+        );
+      }
+
+      Future<Uint8List> runHiChain3Flow({
+        required Uint8List selfAuthId,
+        required Uint8List pinCodeBytes,
+      }) async {
+        final hiChain3Params = createHiChain3Params();
+        final Uint8List authToken = await runHiChain3AuthFlow(
+          selfAuthId: selfAuthId,
+          pinCodeBytes: pinCodeBytes,
+          hkdfInfoSession: hiChain3Params.hkdfInfoSession,
+          aadIsoExchange: hiChain3Params.aadIsoExchange,
+          aadIsoResult: hiChain3Params.aadIsoResult,
+        );
+        return runHiChain3BindFlow(
+          selfAuthId: selfAuthId,
+          authToken: authToken,
+          hkdfInfoSession: hiChain3Params.hkdfInfoSession,
+          hkdfInfoReturn: hiChain3Params.hkdfInfoReturn,
+          aadIsoResult: hiChain3Params.aadIsoResult,
+        );
+      }
+
       // 1) LinkParams: unencrypted, unsliced.
       stage = 'LinkParams (0x01/0x01)';
       debugPrint('🔍 [PAIR] Request LinkParams');
@@ -1943,713 +2528,19 @@ class HuaweiBand10PairingManager {
       // 2) HiChain3 (authType=0x5) uses a different protocol: HiChain (0x01/0x28).
       // For HiChain3 we must derive final `secretKey` and then run only Init (ProductInfo/Battery/SupportedServices).
       if (isHiChain3) {
-        stage = 'PinCode (0x01/0x2C) [HiChain3]';
-        debugPrint('🧩 [PAIR] Request PinCode for HiChain3');
-
-        final pinPacket = await sendAndWait(
-          step: 'PinCode',
-          serviceId: _serviceId,
-          commandId: _cmdPinCode,
-          tlv: HuaweiTLV()..putTag(0x01),
-          encryptedTlV: false,
-          isSliced: true,
-        );
-        final pinTlv = decryptIfNeeded(pinPacket.tlv);
-        final pinMessage = pinTlv.getBytes(0x01);
-        final pinIv = pinTlv.getBytes(0x02);
-        final pinCrypto = HuaweiCrypto(
-          authVersion,
-          authAlgo,
-          deviceSupportType,
-          authMode,
-        );
-        pinCode = pinCrypto.decryptPinCode(encryptMethod, pinMessage, pinIv);
-        debugPrint('🔑 [PAIR] PinCode decrypted (len=${pinCode.length})');
+        pinCode = await requestHiChain3PinCode();
 
         final Uint8List selfAuthId = hiChainSelfAuthId!;
-
-        Uint8List randomBytes(int len) {
-          final rng = Random.secure();
-          return Uint8List.fromList(
-            List.generate(len, (_) => rng.nextInt(256)),
-          );
-        }
-
-        Uint8List hexToBytes(String hexStr) {
-          final s = hexStr.trim();
-          if (s.isEmpty) return Uint8List(0);
-          if (s.length.isOdd) {
-            throw StateError('Invalid hex string length: ${s.length}');
-          }
-          final out = Uint8List(s.length ~/ 2);
-          for (var i = 0; i < out.length; i++) {
-            final slice = s.substring(i * 2, i * 2 + 2);
-            out[i] = int.parse(slice, radix: 16);
-          }
-          return out;
-        }
-
-        Uint8List concatBytes(List<Uint8List> parts) {
-          final totalLen = parts.fold<int>(0, (sum, p) => sum + p.length);
-          final out = Uint8List(totalLen);
-          var offset = 0;
-          for (final p in parts) {
-            out.setRange(offset, offset + p.length, p);
-            offset += p.length;
-          }
-          return out;
-        }
-
-        const String groupId =
-            '7B0BC0CBCE474F6C238D9661C63400B797B166EA7849B3A370FC73A9A236E989';
-
-        HuaweiTLV buildHiChainRequestTlv({
-          required int operationCode, // 0x01 auth, 0x02 bind
-          required int requestId,
-          required int
-          messageId, // step (1..4); device may OR with 0x10 for bind
-          required Map<String, dynamic> payloadExtra,
-          required Map<String, dynamic> outerExtra,
-        }) {
-          final effectiveMessageId = operationCode == 0x02
-              ? (messageId | 0x10)
-              : messageId;
-
-          final jsonPayload = <String, dynamic>{
-            'version': {'minVersion': '1.0.0', 'currentVersion': '2.0.16'},
-            ...payloadExtra,
-          };
-
-          final outerValue = <String, dynamic>{
-            'authForm': 0x00,
-            'payload': jsonPayload,
-            'groupAndModuleVersion': '2.0.1',
-            'message': effectiveMessageId,
-            ...outerExtra,
-          };
-
-          if (operationCode == 0x01) {
-            final selfAuthStr = utf8.decode(selfAuthId);
-            outerValue.addAll({
-              'requestId': requestId.toString(),
-              'groupId': groupId,
-              'groupName': 'health_group_name',
-              'groupOp': 2,
-              'groupType': 256,
-              'peerDeviceId': selfAuthStr,
-              'connDeviceId': selfAuthStr,
-              'appId': 'com.huawei.health',
-              'ownerName': '',
-            });
-          }
-
-          final requestIdBytes = ByteData(8);
-          requestIdBytes.setInt64(0, requestId, Endian.big);
-
-          return HuaweiTLV()
-            ..putString(0x01, jsonEncode(outerValue))
-            ..putByte(0x02, operationCode)
-            ..putBytes(0x03, requestIdBytes.buffer.asUint8List());
-        }
-
-        Map<String, dynamic> parseHiChainPayload(HuaweiTLV tlv) {
-          if (!tlv.containsTag(0x01)) {
-            throw StateError('HiChain response missing TLV tag 0x01');
-          }
-          // Some firmwares append trailing zero bytes; gadgetbridge's getString()
-          // is effectively "until null terminator".
-          var jsonBytes = tlv.getBytes(0x01);
-          final nullIdx = jsonBytes.indexWhere((b) => b == 0);
-          if (nullIdx >= 0) {
-            jsonBytes = jsonBytes.sublist(0, nullIdx);
-          }
-          var jsonStr = utf8.decode(jsonBytes, allowMalformed: true);
-
-          // Be defensive: keep only the first JSON object we can parse.
-          final firstBrace = jsonStr.indexOf('{');
-          final lastBrace = jsonStr.lastIndexOf('}');
-          if (firstBrace >= 0 && lastBrace > firstBrace) {
-            jsonStr = jsonStr.substring(firstBrace, lastBrace + 1);
-          } else {
-            // Some Step4 bind responses carry plain app id (e.g. com.huawei.health)
-            // instead of JSON payload.
-            return <String, dynamic>{'payloadRaw': jsonStr.trim()};
-          }
-
-          try {
-            final decoded = jsonDecode(jsonStr);
-            if (decoded is Map<String, dynamic>) {
-              final payload = decoded['payload'];
-              if (payload is Map<String, dynamic>) {
-                return payload;
-              }
-              if (payload != null) {
-                return <String, dynamic>{'payloadRaw': payload};
-              }
-              return decoded;
-            }
-            return <String, dynamic>{'payloadRaw': decoded};
-          } on FormatException {
-            return <String, dynamic>{'payloadRaw': jsonStr.trim()};
-          }
-        }
-
-        Uint8List hkdfInfoSession = Uint8List.fromList(
-          utf8.encode('hichain_iso_session_key'),
-        );
-        Uint8List hkdfInfoReturn = Uint8List.fromList(
-          utf8.encode('hichain_return_key'),
-        );
-        Uint8List aadIsoExchange = Uint8List.fromList(
-          utf8.encode('hichain_iso_exchange'),
-        );
-        Uint8List aadIsoResult = Uint8List.fromList(
-          utf8.encode('hichain_iso_result'),
-        );
-
-        stage = 'HiChain3 auth (0x01/0x28)';
-        final int requestIdAuth = DateTime.now().millisecondsSinceEpoch;
-        final Uint8List seedAuth = randomBytes(32);
-        final Uint8List randSelfAuth = randomBytes(16);
-
-        // Step 1 (auth)
-        final step1AuthPkt = await sendAndWait(
-          step: 'HiChain3 Auth Step1',
-          serviceId: _serviceId,
-          commandId: _cmdHiChain,
-          tlv: buildHiChainRequestTlv(
-            operationCode: 0x01,
-            requestId: requestIdAuth,
-            messageId: 0x01,
-            payloadExtra: {
-              'isoSalt': hex(randSelfAuth),
-              'peerAuthId': hex(selfAuthId),
-              'operationCode': 0x01,
-              'seed': hex(seedAuth),
-              'peerUserType': 0x00,
-            },
-            outerExtra: const {},
-          ),
-          encryptedTlV: false,
-          isSliced: true,
-        );
-
-        final payload1Auth = parseHiChainPayload(step1AuthPkt.tlv);
-        final isoSaltHexAuth = payload1Auth['isoSalt'] as String?;
-        final peerAuthIdHexAuth = payload1Auth['peerAuthId'] as String?;
-        final tokenHexAuth = payload1Auth['token'] as String?;
-        final errCode1 = payload1Auth['errorCode'];
-        if (isoSaltHexAuth == null ||
-            peerAuthIdHexAuth == null ||
-            tokenHexAuth == null) {
-          debugPrint(
-            '⚠️ [PAIR] HiChain3 auth step1 payload parse issue: keys=${payload1Auth.keys} errorCode=$errCode1 payload=$payload1Auth',
-          );
-          throw StateError(
-            'HiChain3 auth step1 missing isoSalt/peerAuthId/token',
-          );
-        }
-        final Uint8List randPeerAuth = hexToBytes(isoSaltHexAuth);
-        final Uint8List authIdPeerAuth = hexToBytes(peerAuthIdHexAuth);
-        final Uint8List peerTokenAuth = hexToBytes(tokenHexAuth);
-
-        // psk = HMAC( digest(pinCodeHexBytes), seed )
-        final pinHexUpper = hex(pinCode);
-        final pinKey = HuaweiCrypto.sha256Bytes(
-          Uint8List.fromList(utf8.encode(pinHexUpper)),
-        );
-        final Uint8List pskAuth = HuaweiCrypto.hmacSha256(pinKey, seedAuth);
-
-        // gadgetbridge:
-        // - tokenCheck (peerToken) = HMAC(psk, randPeer + randSelf + authIdSelf + authIdPeer)
-        // - selfToken (sent in Step2) = HMAC(psk, randSelf + randPeer + authIdPeer + authIdSelf)
-        final peerMsgAuth = concatBytes([
-          randPeerAuth,
-          randSelfAuth,
-          selfAuthId,
-          authIdPeerAuth,
-        ]);
-        final tokenCheckAuth = HuaweiCrypto.hmacSha256(pskAuth, peerMsgAuth);
-        if (!listEquals(tokenCheckAuth, peerTokenAuth)) {
-          debugPrint(
-            '⚠️ [PAIR] HiChain3 auth peerToken mismatch; computed=${hex(tokenCheckAuth)} device=${hex(peerTokenAuth)}',
-          );
-        }
-
-        final selfMsgAuth = concatBytes([
-          randSelfAuth,
-          randPeerAuth,
-          authIdPeerAuth,
-          selfAuthId,
-        ]);
-        final selfTokenAuth = HuaweiCrypto.hmacSha256(pskAuth, selfMsgAuth);
-
-        // Step 2 (auth)
-        final step2AuthPkt = await sendAndWait(
-          step: 'HiChain3 Auth Step2',
-          serviceId: _serviceId,
-          commandId: _cmdHiChain,
-          tlv: buildHiChainRequestTlv(
-            operationCode: 0x01,
-            requestId: requestIdAuth,
-            messageId: 0x02,
-            payloadExtra: {
-              'peerAuthId': hex(selfAuthId),
-              'token': hex(selfTokenAuth),
-            },
-            outerExtra: const {},
-          ),
-          encryptedTlV: false,
-          isSliced: true,
-        );
-
-        final payload2Auth = parseHiChainPayload(step2AuthPkt.tlv);
-        final returnCodeMacHexAuth = payload2Auth['returnCodeMac'] as String?;
-        final errCode2 = payload2Auth['errorCode'];
-        if (returnCodeMacHexAuth == null) {
-          debugPrint(
-            '⚠️ [PAIR] HiChain3 auth step2 payload parse issue: keys=${payload2Auth.keys} errorCode=$errCode2 payload=$payload2Auth',
-          );
-          throw StateError('HiChain3 auth step2 missing returnCodeMac');
-        }
-        final Uint8List returnCodeMacAuth = hexToBytes(returnCodeMacHexAuth);
-        final expectedReturnCodeMacAuth = HuaweiCrypto.hmacSha256(
-          pskAuth,
-          Uint8List(4),
-        );
-        if (!listEquals(returnCodeMacAuth, expectedReturnCodeMacAuth)) {
-          debugPrint(
-            '⚠️ [PAIR] HiChain3 auth returnCodeMac mismatch (continuing). computed=${hex(expectedReturnCodeMacAuth)} device=${hex(returnCodeMacAuth)}',
-          );
-        }
-
-        // Step 3 (auth)
-        final Uint8List saltAuth = concatBytes([randSelfAuth, randPeerAuth]);
-        final Uint8List sessionKeyAuth = HuaweiCrypto.hkdfSha256(
-          secretKey: pskAuth,
-          salt: saltAuth,
-          info: hkdfInfoSession,
-          outputLength: 32,
-        );
-
-        final Uint8List nonceStep3Auth = randomBytes(12);
-        final Uint8List challengeAuth = randomBytes(16);
-        final Uint8List encDataAuth = HuaweiCrypto.encryptAesGcmNoPadWithAad(
-          challengeAuth,
-          sessionKeyAuth,
-          nonceStep3Auth,
-          aadIsoExchange,
-        );
-
-        final step3AuthPkt = await sendAndWait(
-          step: 'HiChain3 Auth Step3',
-          serviceId: _serviceId,
-          commandId: _cmdHiChain,
-          tlv: buildHiChainRequestTlv(
-            operationCode: 0x01,
-            requestId: requestIdAuth,
-            messageId: 0x03,
-            payloadExtra: {
-              'nonce': hex(nonceStep3Auth),
-              'encData': hex(encDataAuth),
-            },
-            outerExtra: const {},
-          ),
-          encryptedTlV: false,
-          isSliced: true,
-        );
-
-        final payload3Auth = parseHiChainPayload(step3AuthPkt.tlv);
-        final Uint8List nonceRespAuth = hexToBytes(
-          payload3Auth['nonce'] as String,
-        );
-        final Uint8List encAuthTokenAuth = hexToBytes(
-          payload3Auth['encAuthToken'] as String,
-        );
-        final Uint8List authToken = HuaweiCrypto.decryptAesGcmNoPadWithAad(
-          encAuthTokenAuth,
-          sessionKeyAuth,
-          nonceRespAuth,
-          challengeAuth,
-        );
-
-        // Step 4 (auth)
-        final Uint8List nonceStep4Auth = randomBytes(12);
-        final Uint8List encResultAuth = HuaweiCrypto.encryptAesGcmNoPadWithAad(
-          Uint8List(4),
-          sessionKeyAuth,
-          nonceStep4Auth,
-          aadIsoResult,
-        );
-
-        await sendAndWait(
-          step: 'HiChain3 Auth Step4',
-          serviceId: _serviceId,
-          commandId: _cmdHiChain,
-          tlv: buildHiChainRequestTlv(
-            operationCode: 0x01,
-            requestId: requestIdAuth,
-            messageId: 0x04,
-            payloadExtra: {
-              'nonce': hex(nonceStep4Auth),
-              'encResult': hex(encResultAuth),
-              'operationCode': 0x01,
-            },
-            outerExtra: const {},
-          ),
-          encryptedTlV: false,
-          isSliced: true,
-          maxRetries: 0,
-        );
-
-        stage = 'HiChain3 bind (0x01/0x28)';
-        final int requestIdBind = DateTime.now().millisecondsSinceEpoch;
-        final Uint8List seedBind = randomBytes(32);
-        final Uint8List randSelfBind = randomBytes(16);
-
-        // Step 1 (bind)
-        final step1BindPkt = await sendAndWait(
-          step: 'HiChain3 Bind Step1',
-          serviceId: _serviceId,
-          commandId: _cmdHiChain,
-          tlv: buildHiChainRequestTlv(
-            operationCode: 0x02,
-            requestId: requestIdBind,
-            messageId: 0x01,
-            payloadExtra: {
-              'isoSalt': hex(randSelfBind),
-              'peerAuthId': hex(selfAuthId),
-              'operationCode': 0x02,
-              'seed': hex(seedBind),
-              'peerUserType': 0x00,
-              'pkgName': 'com.huawei.devicegroupmanage',
-              'serviceType': groupId,
-              'keyLength': 0x20,
-            },
-            outerExtra: const {'isDeviceLevel': false},
-          ),
-          encryptedTlV: false,
-          isSliced: true,
-        );
-
-        final payload1Bind = parseHiChainPayload(step1BindPkt.tlv);
-        final isoSaltHexBind = payload1Bind['isoSalt'] as String?;
-        final peerAuthIdHexBind = payload1Bind['peerAuthId'] as String?;
-        final tokenHexBind = payload1Bind['token'] as String?;
-        final errCode1b = payload1Bind['errorCode'];
-        if (isoSaltHexBind == null ||
-            peerAuthIdHexBind == null ||
-            tokenHexBind == null) {
-          debugPrint(
-            '⚠️ [PAIR] HiChain3 bind step1 payload parse issue: keys=${payload1Bind.keys} errorCode=$errCode1b payload=$payload1Bind',
-          );
-          throw StateError(
-            'HiChain3 bind step1 missing isoSalt/peerAuthId/token',
-          );
-        }
-        final Uint8List randPeerBind = hexToBytes(isoSaltHexBind);
-        final Uint8List authIdPeerBind = hexToBytes(peerAuthIdHexBind);
-        final Uint8List peerTokenBind = hexToBytes(tokenHexBind);
-
-        final Uint8List pskBind = HuaweiCrypto.hmacSha256(authToken, seedBind);
-        // gadgetbridge:
-        // - tokenCheck (peerToken) = HMAC(psk, randPeer + randSelf + authIdSelf + authIdPeer)
-        // - selfToken (sent in Step2) = HMAC(psk, randSelf + randPeer + authIdPeer + authIdSelf)
-        final peerMsgBind = concatBytes([
-          randPeerBind,
-          randSelfBind,
-          selfAuthId,
-          authIdPeerBind,
-        ]);
-        final tokenCheckBind = HuaweiCrypto.hmacSha256(pskBind, peerMsgBind);
-        if (!listEquals(tokenCheckBind, peerTokenBind)) {
-          debugPrint(
-            '⚠️ [PAIR] HiChain3 bind peerToken mismatch; computed=${hex(tokenCheckBind)} device=${hex(peerTokenBind)}',
-          );
-        }
-
-        final selfMsgBind = concatBytes([
-          randSelfBind,
-          randPeerBind,
-          authIdPeerBind,
-          selfAuthId,
-        ]);
-        final selfTokenBind = HuaweiCrypto.hmacSha256(pskBind, selfMsgBind);
-
-        // Step 2 (bind)
-        final step2BindPkt = await sendAndWait(
-          step: 'HiChain3 Bind Step2',
-          serviceId: _serviceId,
-          commandId: _cmdHiChain,
-          tlv: buildHiChainRequestTlv(
-            operationCode: 0x02,
-            requestId: requestIdBind,
-            messageId: 0x02,
-            payloadExtra: {
-              'peerAuthId': hex(selfAuthId),
-              'token': hex(selfTokenBind),
-            },
-            outerExtra: const {'isDeviceLevel': false},
-          ),
-          encryptedTlV: false,
-          isSliced: true,
-        );
-
-        final payload2Bind = parseHiChainPayload(step2BindPkt.tlv);
-        final returnCodeMacHexBind = payload2Bind['returnCodeMac'] as String?;
-        final errCode2b = payload2Bind['errorCode'];
-        if (returnCodeMacHexBind == null) {
-          debugPrint(
-            '⚠️ [PAIR] HiChain3 bind step2 payload parse issue: keys=${payload2Bind.keys} errorCode=$errCode2b payload=$payload2Bind',
-          );
-          throw StateError('HiChain3 bind step2 missing returnCodeMac');
-        }
-        final Uint8List returnCodeMacBind = hexToBytes(returnCodeMacHexBind);
-        final expectedReturnCodeMacBind = HuaweiCrypto.hmacSha256(
-          pskBind,
-          Uint8List(4),
-        );
-        if (!listEquals(returnCodeMacBind, expectedReturnCodeMacBind)) {
-          debugPrint(
-            '⚠️ [PAIR] HiChain3 bind returnCodeMac mismatch (continuing). computed=${hex(expectedReturnCodeMacBind)} device=${hex(returnCodeMacBind)}',
-          );
-        }
-
-        // Step 3 (bind) and Step 4 (bind response).
-        // Проблема вашего лога как раз в пропуске сообщения с message=0x13.
-        // Делаем явный Step3, после чего ждём ответ Step4.
-        final Uint8List saltBind = concatBytes([randSelfBind, randPeerBind]);
-        final Uint8List sessionKeyBind = HuaweiCrypto.hkdfSha256(
-          secretKey: pskBind,
-          salt: saltBind,
-          info: hkdfInfoSession,
-          outputLength: 32,
-        );
-
-        final Uint8List nonceStep3Bind = randomBytes(12);
-        final Uint8List encDataBind = HuaweiCrypto.encryptAesGcmNoPadWithAad(
-          Uint8List(4),
-          sessionKeyBind,
-          nonceStep3Bind,
-          aadIsoResult,
-        );
-
-        final step3BindTlv = buildHiChainRequestTlv(
-          operationCode: 0x02,
-          requestId: requestIdBind,
-          messageId: 0x03, // effective message becomes 0x13 for bind.
-          payloadExtra: {
-            // Step3 повторяет peerAuthId/token из Step2 и добавляет nonce/encResult.
-            'peerAuthId': hex(selfAuthId),
-            'token': hex(selfTokenBind),
-            'encResult': hex(encDataBind),
-            'nonce': hex(nonceStep3Bind),
-            'operationCode': 0x02,
-          },
-          outerExtra: const {'isDeviceLevel': false},
-        );
-
-        // Некоторые прошивки могут не прислать ответ на Step4, но мы ждём его
-        // в тех же рамках, что и раньше (и для Band10 это критично).
-        final step4ResponseFuture = waitPacket(_serviceId, _cmdHiChain);
-        await sendPacket(
-          serviceId: _serviceId,
-          commandId: _cmdHiChain,
-          tlv: step3BindTlv,
-          encryptedTlV: false,
-          isSliced: true,
-        );
-        try {
-          final step4RespPkt = await step4ResponseFuture;
-          try {
-            final payload4 = parseHiChainPayload(step4RespPkt.tlv);
-            debugPrint(
-              '🧾 [PAIR] HiChain3 bind Step4 payload keys=${payload4.keys} errorCode=${payload4['errorCode']} returnCodeMac=${payload4['returnCodeMac']}',
-            );
-          } catch (e) {
-            debugPrint(
-              '⚠️ [PAIR] HiChain3 bind Step4 payload parse failed: $e',
-            );
-          }
-        } on TimeoutException catch (_) {
-          if (deviceSupportType == 0x04) {
-            // For Band 10 (HiChain3), skipping init after this timeout reduces
-            // the chance of device-side disconnect on SupportedServices.
-            throw StateError(
-              'HiChain3 bind Step4 response timeout (Band10) after Step3',
-            );
-          }
-          debugPrint(
-            '⚠️ [PAIR] HiChain3 bind Step4 response timeout after Step3, continuing...',
-          );
-        } catch (_) {
-          debugPrint(
-            '⚠️ [PAIR] HiChain3 bind Step4 response timeout after Step3, continuing...',
-          );
-        }
-
-        // gadgetbridge: key = hkdfSha256(sessionKey, salt, info="hichain_return_key", 32)
-        secretKey = HuaweiCrypto.hkdfSha256(
-          secretKey: sessionKeyBind,
-          salt: saltBind,
-          info: hkdfInfoReturn,
-          outputLength: 32,
+        secretKey = await runHiChain3Flow(
+          selfAuthId: selfAuthId,
+          pinCodeBytes: pinCode,
         );
 
         debugPrint(
           '🔐 [PAIR] HiChain3 derived secretKey (len=${secretKey.length})',
         );
 
-        // 7) Init: ProductInfo/Battery/SupportedServices (and TimeRequest)
-        stage = 'Init: ProductInfo (0x01/0x07)';
-        debugPrint('🧾 [PAIR] Request ProductInfo');
-        final productTlv = HuaweiTLV();
-        for (final t in _productInfoTagsNormal) {
-          productTlv.putTag(t);
-        }
-        final productPacket = await sendAndWait(
-          step: 'ProductInfo',
-          serviceId: _serviceId,
-          commandId: _cmdProductInfo,
-          tlv: productTlv,
-          encryptedTlV: true,
-          isSliced: true,
-        );
-        final productTlvResp = decryptIfNeeded(productPacket.tlv);
-        final productModelBytes = productTlvResp.containsTag(0x0A)
-            ? productTlvResp.getBytes(0x0A)
-            : null;
-        final productModel = productModelBytes == null
-            ? null
-            : utf8.decode(productModelBytes).trim();
-        debugPrint(
-          '🏷️ [PAIR] ProductInfo parsed (model=${productModel ?? 'null'})',
-        );
-
-        // TimeRequest (ignore response).
-        stage = 'Init: TimeRequest (0x01/0x05)';
-        debugPrint('⏰ [PAIR] Send TimeRequest (response optional)');
-        await sendPacket(
-          serviceId: _serviceId,
-          commandId: _cmdTimeRequest,
-          tlv: _timeRequestTlv(),
-          encryptedTlV: true,
-          isSliced: true,
-        );
-        try {
-          await waitPacket(_serviceId, _cmdTimeRequest);
-        } catch (_) {}
-
-        // BatteryLevel.
-        stage = 'Init: BatteryLevel (0x01/0x08)';
-        debugPrint('🔋 [PAIR] Request BatteryLevel');
-        final batteryPacket = await sendAndWait(
-          step: 'BatteryLevel',
-          serviceId: _serviceId,
-          commandId: _cmdBatteryLevel,
-          tlv: HuaweiTLV()..putTag(0x01),
-          encryptedTlV: true,
-          isSliced: true,
-        );
-
-        debugPrint('🔋 [PAIR] BatteryPacket: ${batteryPacket.tlv.serialize()}');
-        final batteryTlvResp = decryptIfNeeded(batteryPacket.tlv);
-        int? batteryLevel = extractBatteryLevelFromTlv(batteryTlvResp);
-
-        // Some firmwares may return only an ACK/status TLV for BatteryLevel request.
-        // In that case, the real level is sent later as BatteryLevel.id_change (0x01/0x27).
-        if (batteryLevel == null) {
-          debugPrint(
-            '🔋 [PAIR] BatteryLevel tag 0x01 missing, waiting async BatteryLevel (0x01/0x27)...',
-          );
-          try {
-            final batteryChangePacket = await waitPacket(
-              _serviceId,
-              _cmdBatteryLevelChange,
-            );
-            final batteryChangeTlvResp = decryptIfNeeded(
-              batteryChangePacket.tlv,
-            );
-            debugPrint(
-              '🔋 [PAIR] BatteryLevel change decrypted tags: has01=${batteryChangeTlvResp.containsTag(0x01)} has02=${batteryChangeTlvResp.containsTag(0x02)} has03=${batteryChangeTlvResp.containsTag(0x03)}',
-            );
-            batteryLevel = extractBatteryLevelFromTlv(batteryChangeTlvResp);
-          } catch (_) {
-            batteryLevel = null;
-          }
-        }
-
-        // Some firmwares may deliver the actual battery level under the same commandId (0x08)
-        // after the initial ACK/status.
-        if (batteryLevel == null) {
-          debugPrint(
-            '🔋 [PAIR] BatteryLevel still missing, waiting another BatteryLevel (0x01/0x08)...',
-          );
-          try {
-            final batteryPacket2 = await waitPacket(
-              _serviceId,
-              _cmdBatteryLevel,
-            );
-            final batteryTlvResp2 = decryptIfNeeded(batteryPacket2.tlv);
-            batteryLevel = extractBatteryLevelFromTlv(batteryTlvResp2);
-          } catch (_) {
-            batteryLevel = null;
-          }
-        }
-        debugPrint('🔋 [PAIR] BatteryLevel parsed (${batteryLevel ?? "null"})');
-
-        // SupportedServices (must be last in gadgetbridge).
-        stage = 'Init: SupportedServices (0x01/0x02)';
-        debugPrint('🧰 [PAIR] Send SupportedServices');
-        await sendPacket(
-          serviceId: _serviceId,
-          commandId: _cmdSupportedServices,
-          tlv: HuaweiTLV()
-            ..putBytes(0x01, Uint8List.fromList(_knownSupportedServices)),
-          encryptedTlV: true,
-          isSliced: true,
-        );
-        try {
-          await waitPacket(_serviceId, _cmdSupportedServices);
-        } catch (_) {}
-
-        // Считаем pairing успешным только если батарея реально получена.
-        // `productModel` у некоторых прошивок может отсутствовать в раннем ответе,
-        // но это не должно блокировать чтение батареи.
-        if (batteryLevel == null || batteryLevel <= 0) {
-          throw StateError('Init did not return BatteryLevel');
-        }
-
-        final nowMs = DateTime.now().millisecondsSinceEpoch;
-        final session = HuaweiStoredSession(
-          deviceId: deviceId,
-          pairedAtMs: storedSession?.pairedAtMs ?? nowMs,
-          lastSeenAtMs: nowMs,
-          mtu: mtu,
-          sliceSize: sliceSize,
-          authVersion: authVersion,
-          deviceSupportType: deviceSupportType,
-          authAlgo: authAlgo,
-          encryptMethod: encryptMethod,
-          productModel: productModel,
-          lastBatteryLevel: batteryLevel,
-          lastServerNonceHex: serverNonceHex,
-          lastEncryptionCounter: encryptionCounter,
-        );
-        _runtimeCrypto = _HuaweiRuntimeCrypto(
-          secretKey: Uint8List.fromList(secretKey),
-          encryptMethod: encryptMethod,
-          deviceSupportType: deviceSupportType,
-          encryptionCounter: encryptionCounter,
-          sliceSize: sliceSize,
-        );
-        await savePairedDeviceState(session);
-        return HuaweiPairingResult(
-          deviceId: deviceId,
-          productModel: productModel,
-          batteryLevel: batteryLevel,
-          storedSession: session,
-        );
+        return runInitAndPersistResult();
       }
 
       // 2) Secret key (random per session).
@@ -2819,149 +2710,7 @@ class HuaweiBand10PairingManager {
         isSliced: true,
       );
 
-      // 7) Init: ProductInfo/Battery/SupportedServices (and TimeRequest)
-      stage = 'Init: ProductInfo (0x01/0x07)';
-      debugPrint('🧾 [PAIR] Request ProductInfo');
-      final productTlv = HuaweiTLV();
-      for (final t in _productInfoTagsNormal) {
-        productTlv.putTag(t);
-      }
-      final productPacket = await sendAndWait(
-        step: 'ProductInfo',
-        serviceId: _serviceId,
-        commandId: _cmdProductInfo,
-        tlv: productTlv,
-        encryptedTlV: true,
-        isSliced: true,
-      );
-      final productTlvResp = decryptIfNeeded(productPacket.tlv);
-      final productModelBytes = productTlvResp.containsTag(0x0A)
-          ? productTlvResp.getBytes(0x0A)
-          : null;
-      final productModel = productModelBytes == null
-          ? null
-          : utf8.decode(productModelBytes).trim();
-      debugPrint(
-        '🏷️ [PAIR] ProductInfo parsed (model=${productModel ?? 'null'})',
-      );
-
-      // TimeRequest (ignore response).
-      stage = 'Init: TimeRequest (0x01/0x05)';
-      debugPrint('⏰ [PAIR] Send TimeRequest (response optional)');
-      await sendPacket(
-        serviceId: _serviceId,
-        commandId: _cmdTimeRequest,
-        tlv: _timeRequestTlv(),
-        encryptedTlV: true,
-        isSliced: true,
-      );
-      try {
-        await waitPacket(_serviceId, _cmdTimeRequest);
-      } catch (_) {}
-
-      // BatteryLevel.
-      stage = 'Init: BatteryLevel (0x01/0x08)';
-      debugPrint('🔋 [PAIR] Request BatteryLevel');
-      final batteryPacket = await sendAndWait(
-        step: 'BatteryLevel',
-        serviceId: _serviceId,
-        commandId: _cmdBatteryLevel,
-        tlv: HuaweiTLV()..putTag(0x01),
-        encryptedTlV: true,
-        isSliced: true,
-      );
-      final batteryTlvResp = decryptIfNeeded(batteryPacket.tlv);
-      int? batteryLevelMaybe = extractBatteryLevelFromTlv(batteryTlvResp);
-      if (batteryLevelMaybe == null) {
-        // Fallback to async battery update.
-        debugPrint(
-          '🔋 [PAIR] BatteryLevel tag 0x01 missing, waiting async BatteryLevel (0x01/0x27)...',
-        );
-        try {
-          final batteryChangePacket = await waitPacket(
-            _serviceId,
-            _cmdBatteryLevelChange,
-          );
-          final batteryChangeTlvResp = decryptIfNeeded(batteryChangePacket.tlv);
-          debugPrint(
-            '🔋 [PAIR] BatteryLevel change decrypted tags: has01=${batteryChangeTlvResp.containsTag(0x01)} has02=${batteryChangeTlvResp.containsTag(0x02)} has03=${batteryChangeTlvResp.containsTag(0x03)}',
-          );
-          batteryLevelMaybe = extractBatteryLevelFromTlv(batteryChangeTlvResp);
-        } catch (_) {
-          batteryLevelMaybe = null;
-        }
-      }
-
-      if (batteryLevelMaybe == null) {
-        // Some firmwares may deliver the actual battery level under the same
-        // commandId (0x08) after the initial ACK/status.
-        debugPrint(
-          '🔋 [PAIR] BatteryLevel still missing, waiting another BatteryLevel (0x01/0x08)...',
-        );
-        try {
-          final batteryPacket2 = await waitPacket(_serviceId, _cmdBatteryLevel);
-          final batteryTlvResp2 = decryptIfNeeded(batteryPacket2.tlv);
-          batteryLevelMaybe = extractBatteryLevelFromTlv(batteryTlvResp2);
-        } catch (_) {
-          batteryLevelMaybe = null;
-        }
-      }
-
-      final int batteryLevel = batteryLevelMaybe ?? 0;
-      debugPrint(
-        '🔋 [PAIR] BatteryLevel parsed (${batteryLevelMaybe ?? "null"})',
-      );
-
-      // SupportedServices (must be last in gadgetbridge).
-      stage = 'Init: SupportedServices (0x01/0x02)';
-      debugPrint('🧰 [PAIR] Send SupportedServices');
-      await sendPacket(
-        serviceId: _serviceId,
-        commandId: _cmdSupportedServices,
-        tlv: HuaweiTLV()
-          ..putBytes(0x01, Uint8List.fromList(_knownSupportedServices)),
-        encryptedTlV: true,
-        isSliced: true,
-      );
-      try {
-        await waitPacket(_serviceId, _cmdSupportedServices);
-      } catch (_) {}
-
-      // Считаем pairing успешным только если батарея реально получена.
-      if (batteryLevel <= 0) {
-        throw StateError('Init did not return BatteryLevel');
-      }
-
-      final nowMs = DateTime.now().millisecondsSinceEpoch;
-      final session = HuaweiStoredSession(
-        deviceId: deviceId,
-        pairedAtMs: storedSession?.pairedAtMs ?? nowMs,
-        lastSeenAtMs: nowMs,
-        mtu: mtu,
-        sliceSize: sliceSize,
-        authVersion: authVersion,
-        deviceSupportType: deviceSupportType,
-        authAlgo: authAlgo,
-        encryptMethod: encryptMethod,
-        productModel: productModel,
-        lastBatteryLevel: batteryLevel,
-        lastServerNonceHex: serverNonceHex,
-        lastEncryptionCounter: encryptionCounter,
-      );
-      _runtimeCrypto = _HuaweiRuntimeCrypto(
-        secretKey: Uint8List.fromList(secretKey),
-        encryptMethod: encryptMethod,
-        deviceSupportType: deviceSupportType,
-        encryptionCounter: encryptionCounter,
-        sliceSize: sliceSize,
-      );
-      await savePairedDeviceState(session);
-      return HuaweiPairingResult(
-        deviceId: deviceId,
-        productModel: productModel,
-        batteryLevel: batteryLevel,
-        storedSession: session,
-      );
+      return runInitAndPersistResult();
     } catch (e, st) {
       failed = true;
       debugPrint('❌ [PAIR] Failed at stage="$stage": $e\n$st');
