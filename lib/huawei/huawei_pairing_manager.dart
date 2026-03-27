@@ -15,161 +15,11 @@ import 'huawei_hichain3.dart';
 import 'huawei_packet_codec.dart';
 import 'huawei_tlv.dart';
 import 'huawei_capabilities.dart';
-
-class HuaweiPairingResult {
-  final String deviceId;
-  final String? productModel;
-  final int? batteryLevel;
-  final HuaweiStoredSession storedSession;
-
-  const HuaweiPairingResult({
-    required this.deviceId,
-    required this.productModel,
-    required this.batteryLevel,
-    required this.storedSession,
-  });
-}
-
-class HuaweiStoredSession {
-  final String deviceId;
-  final int pairedAtMs;
-  final int lastSeenAtMs;
-  final int? mtu;
-  final int? sliceSize;
-  final int? authVersion;
-  final int? deviceSupportType;
-  final int? authAlgo;
-  final int? encryptMethod;
-  final String? productModel;
-  final int? lastBatteryLevel;
-  final String? lastServerNonceHex;
-  final int? lastEncryptionCounter;
-
-  const HuaweiStoredSession({
-    required this.deviceId,
-    required this.pairedAtMs,
-    required this.lastSeenAtMs,
-    required this.mtu,
-    required this.sliceSize,
-    required this.authVersion,
-    required this.deviceSupportType,
-    required this.authAlgo,
-    required this.encryptMethod,
-    required this.productModel,
-    required this.lastBatteryLevel,
-    required this.lastServerNonceHex,
-    required this.lastEncryptionCounter,
-  });
-
-  Map<String, Object?> toJson() => {
-    'deviceId': deviceId,
-    'pairedAtMs': pairedAtMs,
-    'lastSeenAtMs': lastSeenAtMs,
-    'mtu': mtu,
-    'sliceSize': sliceSize,
-    'authVersion': authVersion,
-    'deviceSupportType': deviceSupportType,
-    'authAlgo': authAlgo,
-    'encryptMethod': encryptMethod,
-    'productModel': productModel,
-    'lastBatteryLevel': lastBatteryLevel,
-    'lastServerNonceHex': lastServerNonceHex,
-    'lastEncryptionCounter': lastEncryptionCounter,
-  };
-
-  static HuaweiStoredSession? fromJson(Map<String, dynamic> json) {
-    final deviceId = json['deviceId'];
-    final pairedAtMs = json['pairedAtMs'];
-    final lastSeenAtMs = json['lastSeenAtMs'];
-    if (deviceId is! String || pairedAtMs is! int || lastSeenAtMs is! int) {
-      return null;
-    }
-    return HuaweiStoredSession(
-      deviceId: deviceId,
-      pairedAtMs: pairedAtMs,
-      lastSeenAtMs: lastSeenAtMs,
-      mtu: json['mtu'] as int?,
-      sliceSize: json['sliceSize'] as int?,
-      authVersion: json['authVersion'] as int?,
-      deviceSupportType: json['deviceSupportType'] as int?,
-      authAlgo: json['authAlgo'] as int?,
-      encryptMethod: json['encryptMethod'] as int?,
-      productModel: json['productModel'] as String?,
-      lastBatteryLevel: json['lastBatteryLevel'] as int?,
-      lastServerNonceHex: json['lastServerNonceHex'] as String?,
-      lastEncryptionCounter: json['lastEncryptionCounter'] as int?,
-    );
-  }
-}
-
-class HuaweiLiveMetrics {
-  final String? deviceId;
-  final bool isConnected;
-  final int? heartRate;
-  final int? steps;
-  final DateTime updatedAt;
-
-  const HuaweiLiveMetrics({
-    required this.deviceId,
-    required this.isConnected,
-    required this.heartRate,
-    required this.steps,
-    required this.updatedAt,
-  });
-
-  factory HuaweiLiveMetrics.disconnected() {
-    return HuaweiLiveMetrics(
-      deviceId: null,
-      isConnected: false,
-      heartRate: null,
-      steps: null,
-      updatedAt: DateTime.now(),
-    );
-  }
-
-  HuaweiLiveMetrics copyWith({
-    String? deviceId,
-    bool? isConnected,
-    int? heartRate,
-    bool clearHeartRate = false,
-    int? steps,
-    bool clearSteps = false,
-  }) {
-    return HuaweiLiveMetrics(
-      deviceId: deviceId ?? this.deviceId,
-      isConnected: isConnected ?? this.isConnected,
-      heartRate: clearHeartRate ? null : (heartRate ?? this.heartRate),
-      steps: clearSteps ? null : (steps ?? this.steps),
-      updatedAt: DateTime.now(),
-    );
-  }
-}
-
-class _HuaweiRuntimeCrypto {
-  final Uint8List secretKey;
-  final int encryptMethod;
-  final int deviceSupportType;
-  int encryptionCounter;
-  final int sliceSize;
-
-  _HuaweiRuntimeCrypto({
-    required this.secretKey,
-    required this.encryptMethod,
-    required this.deviceSupportType,
-    required this.encryptionCounter,
-    required this.sliceSize,
-  });
-}
-
-class _HuaweiInitResult {
-  final String? productModel;
-  final int batteryLevel;
-
-  const _HuaweiInitResult({
-    required this.productModel,
-    required this.batteryLevel,
-  });
-}
+import 'huawei_pairing_result.dart';
+import 'huawei_stored_session.dart';
+import 'huawei_live_metrics.dart';
+import 'huawei_runtime_crypto.dart';
+import 'huawei_init_result.dart';
 
 class HuaweiBand10PairingManager {
   static const MethodChannel _androidBondChannel = MethodChannel(
@@ -240,7 +90,7 @@ class HuaweiBand10PairingManager {
   final Map<String, Queue<Completer<HuaweiPacket>>> _liveWaiters = {};
   HuaweiLiveMetrics _latestLiveMetrics = HuaweiLiveMetrics.disconnected();
   String? _liveMetricsDeviceId;
-  _HuaweiRuntimeCrypto? _runtimeCrypto;
+  HuaweiRuntimeCrypto? _runtimeCrypto;
   int _liveRequestMode = 0;
   static const int _statusOk = 0x000186A0;
   static const int _statusUnsupported = 0x000186A4;
@@ -1483,7 +1333,7 @@ class HuaweiBand10PairingManager {
       ..putBytes(0x7E, cipherText);
   }
 
-  Uint8List _nextLiveIv(_HuaweiRuntimeCrypto crypto) {
+  Uint8List _nextLiveIv(HuaweiRuntimeCrypto crypto) {
     if (crypto.deviceSupportType == 0x04) {
       return HuaweiCrypto.generateNonce();
     }
@@ -1725,7 +1575,7 @@ class HuaweiBand10PairingManager {
         throw StateError('$step failed');
       }
 
-      Future<_HuaweiInitResult> runPostBondInit() async {
+      Future<HuaweiInitResult> runPostBondInit() async {
         // 7) Init: ProductInfo/Battery/SupportedServices (and TimeRequest)
         stage = 'Init: ProductInfo (0x01/0x07)';
         debugPrint('🧾 [PAIR] Request ProductInfo');
@@ -1834,7 +1684,7 @@ class HuaweiBand10PairingManager {
           throw StateError('Init did not return BatteryLevel');
         }
 
-        return _HuaweiInitResult(
+        return HuaweiInitResult(
           productModel: productModel,
           batteryLevel: batteryLevel,
         );
@@ -1863,7 +1713,7 @@ class HuaweiBand10PairingManager {
           lastServerNonceHex: serverNonceHex,
           lastEncryptionCounter: encryptionCounter,
         );
-        _runtimeCrypto = _HuaweiRuntimeCrypto(
+        _runtimeCrypto = HuaweiRuntimeCrypto(
           secretKey: Uint8List.fromList(secretKey),
           encryptMethod: encryptMethod,
           deviceSupportType: deviceSupportType,
