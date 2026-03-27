@@ -19,6 +19,8 @@ class _MyHomePageState extends State<MyHomePage> {
       HuaweiBand10PairingManager();
   bool _isScanning = false;
   bool _isRestoringSaved = false;
+  bool _isConnectingSaved = false;
+  bool _isRequestingPulse = false;
   HuaweiStoredSession? _lastStoredSession;
 
   @override
@@ -79,6 +81,81 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  Future<void> _connectSavedSystemDevice() async {
+    final last = _lastStoredSession;
+    if (last == null ||
+        _isConnectingSaved ||
+        _isRestoringSaved ||
+        _isScanning) {
+      return;
+    }
+    setState(() => _isConnectingSaved = true);
+    try {
+      try {
+        await UniversalBle.stopScan();
+      } catch (_) {}
+
+      await UniversalBle.connect(last.deviceId);
+      await _pairingManager.startLiveMetrics(last.deviceId);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Системное подключение: ${last.deviceId}')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Не удалось подключить устройство: $e')),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isConnectingSaved = false);
+      }
+    }
+  }
+
+  Future<void> _requestPulse() async {
+    final deviceId =
+        _pairingManager.latestLiveMetrics.deviceId ??
+        _lastStoredSession?.deviceId;
+    if (deviceId == null ||
+        _isRequestingPulse ||
+        _isRestoringSaved ||
+        _isScanning) {
+      return;
+    }
+    setState(() => _isRequestingPulse = true);
+    try {
+      final connectedDevices = await UniversalBle.getSystemDevices();
+      final isConnected = connectedDevices.any((d) => d.deviceId == deviceId);
+      if (!isConnected) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Устройство не подключено. Нажмите Restore.'),
+          ),
+        );
+        return;
+      }
+      final metrics = await _pairingManager.requestPulseOnce(deviceId);
+      if (!mounted) return;
+      final stepsText = metrics.steps == null
+          ? 'нет данных'
+          : '${metrics.steps}';
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Шаги: $stepsText')));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Не удалось запросить шаги: $e')));
+    } finally {
+      if (mounted) {
+        setState(() => _isRequestingPulse = false);
+      }
+    }
+  }
+
   void _scanDevices() {
     if (_isScanning) {
       UniversalBle.stopScan();
@@ -109,32 +186,57 @@ class _MyHomePageState extends State<MyHomePage> {
               horizontal: 16.0,
               vertical: 16.0,
             ),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              spacing: 8,
-              children: [
-                Expanded(
-                  child: OutlinedButton(
-                    style: OutlinedButton.styleFrom(
-                      backgroundColor: Theme.of(context).colorScheme.primary,
-                      foregroundColor: Theme.of(context).colorScheme.onPrimary,
-                    ),
-                    onPressed: () {
-                      _scanDevices();
-                    },
-                    child: Text(_isScanning ? 'Stop scanning' : 'Scan devices'),
+            child: SizedBox(
+              height: 120,
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                spacing: 8,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      OutlinedButton(
+                        style: OutlinedButton.styleFrom(
+                          backgroundColor: Theme.of(
+                            context,
+                          ).colorScheme.primary,
+                          foregroundColor: Theme.of(
+                            context,
+                          ).colorScheme.onPrimary,
+                        ),
+                        onPressed: () {
+                          _scanDevices();
+                        },
+                        child: Text(
+                          _isScanning ? 'Stop scanning' : 'Scan devices',
+                        ),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed:
+                            (_isRestoringSaved || _lastStoredSession == null)
+                            ? null
+                            : _restoreLastConnection,
+                        icon: const Icon(Icons.refresh),
+                        label: Text(
+                          _isRestoringSaved ? 'Restoring...' : 'Restore',
+                        ),
+                      ),
+                    ],
                   ),
-                ),
-                Expanded(
-                  child: OutlinedButton.icon(
-                    onPressed: (_isRestoringSaved || _lastStoredSession == null)
+                  OutlinedButton.icon(
+                    onPressed:
+                        (_isConnectingSaved ||
+                            _isRestoringSaved ||
+                            _lastStoredSession == null)
                         ? null
-                        : _restoreLastConnection,
-                    icon: const Icon(Icons.refresh),
-                    label: Text(_isRestoringSaved ? 'Restoring...' : 'Restore'),
+                        : _connectSavedSystemDevice,
+                    icon: const Icon(Icons.bluetooth_connected),
+                    label: Text(
+                      _isConnectingSaved ? 'Подключение...' : 'Подключить',
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
           OutlinedButton(
@@ -235,25 +337,44 @@ class _MyHomePageState extends State<MyHomePage> {
                   ),
                   child: Padding(
                     padding: const EdgeInsets.all(12.0),
-                    child: Row(
+                    child: Column(
                       children: [
-                        Expanded(
-                          child: _MetricTile(
-                            title: 'Пульс',
-                            value: metrics.heartRate == null
-                                ? 'нет данных'
-                                : '${metrics.heartRate} bpm',
-                            icon: Icons.favorite,
-                          ),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _MetricTile(
+                                title: 'Пульс',
+                                value: metrics.heartRate == null
+                                    ? 'нет данных'
+                                    : '${metrics.heartRate} bpm',
+                                icon: Icons.favorite,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: _MetricTile(
+                                title: 'Шаги',
+                                value: metrics.steps == null
+                                    ? 'нет данных'
+                                    : '${metrics.steps}',
+                                icon: Icons.directions_walk,
+                              ),
+                            ),
+                          ],
                         ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: _MetricTile(
-                            title: 'Шаги',
-                            value: metrics.steps == null
-                                ? 'нет данных'
-                                : '${metrics.steps}',
-                            icon: Icons.directions_walk,
+                        const SizedBox(height: 12),
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            onPressed: _isRequestingPulse
+                                ? null
+                                : _requestPulse,
+                            icon: const Icon(Icons.directions_walk),
+                            label: Text(
+                              _isRequestingPulse
+                                  ? 'Запрос шагов...'
+                                  : 'Запросить шаги',
+                            ),
                           ),
                         ),
                       ],
